@@ -1,0 +1,33 @@
+# Core scientific computing
+numpy>=1.20.0
+scipy>=1.7.0
+pandas>=1.3.0
+
+# Neurophysiology data (Neo)
+neo>=0.14.0
+
+# Machine learning and clustering
+scikit-learn>=1.0.0
+pomegranate>=0.14.0
+hdbscan>=0.8.0
+
+# Visualization
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# GPU computing (optional, falls back to CPU if not available)
+torch>=2.0.0  # PyTorch for GPU filtering
+torchaudio>=2.0.0  # Audio processing utilities for PyTorch
+cupy-cuda12x>=12.0.0; sys_platform != "darwin"  # For CUDA 12.x (adjust version as needed)
+# Alternative: cupy-cuda11x for CUDA 11.x or cupy for auto-detection
+
+# Jupyter/IPython support
+jupyter>=1.0.0
+ipython>=7.0.0
+ipykernel>=6.0.0
+
+# Progress bars
+tqdm>=4.60.0
+
+# Note: GMM_Sorter_Funcs is a local module that should be available in the Python path
+# Make sure the GMMSorter directory (or wherever GMM_Sorter_Funcs.py is located) is in your PYTHONPATH
