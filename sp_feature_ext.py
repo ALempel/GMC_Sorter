@@ -14,7 +14,6 @@ except ImportError:
 # Try to use PyTorch for GPU filtering (FFT-based, mainstream approach)
 try:
     import torch
-    from helper_functions import _bandpass_fft_torch
     from extract_spike_features_func import extract_spike_properties_GPU
     TORCH_AVAILABLE = True
     if torch.cuda.is_available():
@@ -29,6 +28,45 @@ except ImportError:
     TORCH_AVAILABLE = False
     DEVICE = None
 
+def _bandpass_fft_torch(x, sample_rate, low_fr, high_fr):
+    """
+    Apply bandpass filter using FFT (mainstream GPU filtering approach).
+    
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input signal, shape (n_channels, n_samples)
+    sample_rate : float
+        Sample rate in Hz
+    low_fr : float
+        Low frequency cutoff in Hz
+    high_fr : float
+        High frequency cutoff in Hz
+        
+    Returns
+    -------
+    torch.Tensor
+        Filtered signal with same shape as input
+    """
+    import torch
+    
+    n_samples = x.shape[-1]
+    # Compute FFT
+    x_fft = torch.fft.rfft(x, dim=-1)
+    
+    # Create frequency axis
+    freqs = torch.fft.rfftfreq(n_samples, 1/sample_rate, device=x.device)
+    
+    # Create bandpass mask
+    mask = (freqs >= low_fr) & (freqs <= high_fr)
+    
+    # Apply mask
+    x_fft_filtered = x_fft * mask.unsqueeze(0)
+    
+    # Inverse FFT
+    x_filtered = torch.fft.irfft(x_fft_filtered, n=n_samples, dim=-1)
+    
+    return x_filtered
 
 def filter_data_GPU(batch_data, sample_rate, low_fr, high_fr, sos_bandpass):
     """
