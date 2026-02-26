@@ -3248,7 +3248,12 @@ class GMCSorter:
             'viz_feature_pairs': viz_pairs,
             'min_points_for_cluster': settings.get('min_points_for_cluster', 100),
         }
-        for cs_idx, cluster_seed in enumerate(list(self.cluster_seeds)):
+        # Order seeds by cluster density (highest first): mean density at seed spike_ids
+        def _seed_mean_density(cs):
+            sid = np.asarray(cs['spike_ids'], dtype=int).ravel()
+            return float(np.mean(cluster_dens[sid])) if len(sid) > 0 else 0.0
+        seeds_by_density = sorted(list(self.cluster_seeds), key=_seed_mean_density, reverse=True)
+        for cs_idx, cluster_seed in enumerate(seeds_by_density):
             spike_ids = np.asarray(cluster_seed['spike_ids'], dtype=int)
             result = make_gaussian_model_from_cluster(
                 properties_filtered, cluster_dens, self.curr_max_prob, spike_ids, settings
@@ -3309,49 +3314,57 @@ class GMCSorter:
                 initial_model=None, properties_for_refit=properties_filtered,
                 cluster_densities_for_refit=cluster_dens, seed_idx_global=seed_idx_global
             )
-            # Remove the cluster seed that was just used (whether accepted or rejected)
-            if cluster_seed in self.cluster_seeds:
-                self.cluster_seeds.remove(cluster_seed)
-            self._refresh_cluster_seeds_ui()
-            if accepted and accept_data is not None:
-                new_spike_ids = np.asarray(accept_data['spike_ids'])
-                if len(new_spike_ids) > 0:
-                    self.gaussian_models.append(accept_data['model'])
-                    new_unit_label = (max(self.unit_labels) + 1) if self.unit_labels else 0
-                    if 'y_pos' in self.prop_titles:
-                        y_pos_idx = self.prop_titles.index('y_pos')
-                        mean_y_pos = float(np.mean(self.all_properties[new_spike_ids, y_pos_idx]))
-                    else:
-                        mean_y_pos = 0.0
-                    m = accept_data['model']
-                    unit_vars = [{
-                        'gaussian': True,
-                        'feature_indices': list(included_feat_idxs),
-                        'center': np.array(m.mean, dtype=float).copy(),
-                        'covariance': np.array(m.covariance, dtype=float).copy(),
-                        'mah_th': float(m.mah_threshold),
-                        'bic_th': float(m.bic_threshold),
-                    }]
-                    if m.data_range is not None:
-                        unit_vars[0]['data_range'] = m.data_range
-                    if m.sort_range is not None:
-                        unit_vars[0]['sort_range'] = m.sort_range
-                    if accept_data.get('sort_feature_idx_global') is not None:
-                        unit_vars[0]['sort_feature_idx'] = accept_data['sort_feature_idx_global']
-                    new_unit = Unit(unit_variables=unit_vars, mean_y_pos=mean_y_pos)
-                    self.unit_info[new_unit_label] = new_unit
-                    self.unit_labels.append(new_unit_label)
-                    self.unit_labels = sorted(self.unit_labels, key=lambda l: self.unit_info[l].mean_y_pos)
-                    self.unit_id[new_spike_ids] = new_unit_label
-                    if self.curr_max_prob is not None and 'curr_max_prob_update' in accept_data:
-                        self.curr_max_prob[new_spike_ids] = np.minimum(self.curr_max_prob[new_spike_ids], accept_data['curr_max_prob_update'])
-                    self._remove_empty_units()
-                    self.resort_unit_labels_by_position()
-                    self.unit_combo['values'] = ["new_unit"] + [f"Unit {l}" for l in self.unit_labels]
-                    self._sync_compare_combo_values()
-                    if len(self.unit_labels) > 0:
-                        self.plot_sorted_check.config(state=tk.NORMAL)
-        self.update_all_plots()
+            try:
+                self._disable_user_buttons()
+                # Remove the cluster seed that was just used (whether accepted or rejected)
+                if cluster_seed in self.cluster_seeds:
+                    self.cluster_seeds.remove(cluster_seed)
+                self._refresh_cluster_seeds_ui()
+                if accepted and accept_data is not None:
+                    new_spike_ids = np.asarray(accept_data['spike_ids'])
+                    if len(new_spike_ids) > 0:
+                        self.gaussian_models.append(accept_data['model'])
+                        new_unit_label = (max(self.unit_labels) + 1) if self.unit_labels else 0
+                        if 'y_pos' in self.prop_titles:
+                            y_pos_idx = self.prop_titles.index('y_pos')
+                            mean_y_pos = float(np.mean(self.all_properties[new_spike_ids, y_pos_idx]))
+                        else:
+                            mean_y_pos = 0.0
+                        m = accept_data['model']
+                        unit_vars = [{
+                            'gaussian': True,
+                            'feature_indices': list(included_feat_idxs),
+                            'center': np.array(m.mean, dtype=float).copy(),
+                            'covariance': np.array(m.covariance, dtype=float).copy(),
+                            'mah_th': float(m.mah_threshold),
+                            'bic_th': float(m.bic_threshold),
+                        }]
+                        if m.data_range is not None:
+                            unit_vars[0]['data_range'] = m.data_range
+                        if m.sort_range is not None:
+                            unit_vars[0]['sort_range'] = m.sort_range
+                        if accept_data.get('sort_feature_idx_global') is not None:
+                            unit_vars[0]['sort_feature_idx'] = accept_data['sort_feature_idx_global']
+                        new_unit = Unit(unit_variables=unit_vars, mean_y_pos=mean_y_pos)
+                        self.unit_info[new_unit_label] = new_unit
+                        self.unit_labels.append(new_unit_label)
+                        self.unit_labels = sorted(self.unit_labels, key=lambda l: self.unit_info[l].mean_y_pos)
+                        self.unit_id[new_spike_ids] = new_unit_label
+                        if self.curr_max_prob is not None and 'curr_max_prob_update' in accept_data:
+                            self.curr_max_prob[new_spike_ids] = np.minimum(self.curr_max_prob[new_spike_ids], accept_data['curr_max_prob_update'])
+                        self._remove_empty_units()
+                        self.resort_unit_labels_by_position()
+                        self.unit_combo['values'] = ["new_unit"] + [f"Unit {l}" for l in self.unit_labels]
+                        self._sync_compare_combo_values()
+                        if len(self.unit_labels) > 0:
+                            self.plot_sorted_check.config(state=tk.NORMAL)
+                self.update_all_plots()
+            finally:
+                self._enable_user_buttons()
+            # Let the main window refresh before the next cluster seed's window (if any)
+            self.root.update_idletasks()
+            self.root.update()
+            time.sleep(0.5)
     
     def assign_units(self):
         """Create Unit objects from currently defined bounds and assign to unassigned spikes (legacy / unused in Cluster mode)."""
@@ -4239,7 +4252,8 @@ class GMCSorter:
             'gaussian_filter_sigma': float(defaults_dict.get('gaussian_filter_sigma', 50.0)),
             'min_points_for_cluster': int(defaults_dict.get('min_points_for_cluster', 100)),
             'viz_feature_pairs': viz_pairs,
-            'report_failures': bool(defaults_dict.get('report_failures', False))
+            'report_failures': bool(defaults_dict.get('report_failures', False)),
+            'skip_user_refinement': bool(defaults_dict.get('skip_user_refinement', False)),
         }
         return settings
     
@@ -4715,7 +4729,127 @@ class GMCSorter:
             progress_win.update_idletasks()
             progress_win.update()
 
-        for seed_idx, seed_original in enumerate(list(self.seeds)):
+        cluster_dens = self.cluster_den if self.cluster_den is not None else np.ones(properties_filtered.shape[0], dtype=float)
+        # Order seeds by cluster density (highest first)
+        seeds_by_density = sorted(list(self.seeds), key=lambda s: float(cluster_dens[s]), reverse=True)
+
+        def _run_completion():
+            if progress_win is not None and progress_win.winfo_exists():
+                try:
+                    progress_bar['value'] = n_seeds
+                    progress_label.config(text="Remaining seeds: 0")
+                    progress_win.update_idletasks()
+                    progress_win.destroy()
+                except tk.TclError:
+                    pass
+            self.update_all_plots()
+            if self.compute_gaussian_models_button is not None:
+                self.compute_gaussian_models_button.config(state=tk.DISABLED)
+            if len(self.unit_labels) > 0:
+                self.resort_unit_labels_by_position()
+            messagebox.showinfo("Complete", f"Gaussian model computation complete. {len(self.gaussian_models)} models accepted.")
+
+        def _process_accept_reject(accepted, accept_data, popup, update_content_fn, current_seed_index_ref):
+            try:
+                self._disable_user_buttons()
+                if popup.winfo_exists():
+                    self._set_buttons_in_frame_state(popup, tk.DISABLED)
+                if accepted:
+                    spike_ids = np.asarray(accept_data['spike_ids'])
+                    if len(spike_ids) > 0:
+                        self.gaussian_models.append(accept_data['model'])
+                        new_unit_label = (max(self.unit_labels) + 1) if self.unit_labels else 0
+                        if self.all_properties is not None and 'y_pos' in self.prop_titles:
+                            y_pos_idx = self.prop_titles.index('y_pos')
+                            mean_y_pos = float(np.mean(self.all_properties[spike_ids, y_pos_idx]))
+                        else:
+                            mean_y_pos = 0.0
+                        m = accept_data['model']
+                        unit_vars = [{
+                            'gaussian': True,
+                            'feature_indices': list(accept_data['feature_indices']),
+                            'center': np.array(m.mean, dtype=float).copy(),
+                            'covariance': np.array(m.covariance, dtype=float).copy(),
+                            'mah_th': float(m.mah_threshold),
+                            'bic_th': float(m.bic_threshold),
+                        }]
+                        if m.data_range is not None:
+                            unit_vars[0]['data_range'] = m.data_range
+                        if m.sort_range is not None:
+                            unit_vars[0]['sort_range'] = m.sort_range
+                        if accept_data.get('sort_feature_idx_global') is not None:
+                            unit_vars[0]['sort_feature_idx'] = accept_data['sort_feature_idx_global']
+                        unit = Unit(unit_variables=unit_vars, mean_y_pos=mean_y_pos)
+                        self.unit_info[new_unit_label] = unit
+                        self.unit_labels.append(new_unit_label)
+                        self.unit_labels = sorted(self.unit_labels, key=lambda l: self.unit_info[l].mean_y_pos)
+                        self.unit_id[spike_ids] = new_unit_label
+                        if self.curr_max_prob is not None and 'curr_max_prob_update' in accept_data:
+                            self.curr_max_prob[spike_ids] = accept_data['curr_max_prob_update']
+                        self._remove_empty_units()
+                        self.unit_combo['values'] = ["new_unit"] + [f"Unit {l}" for l in self.unit_labels]
+                        self._sync_compare_combo_values()
+                        if len(self.unit_labels) > 0:
+                            self.plot_sorted_check.config(state=tk.NORMAL)
+                    m = accept_data['model']
+                    mah_th = float(m.mah_threshold)
+                    mean = m.mean
+                    inv_cov = np.linalg.pinv(m.covariance)
+                    to_remove = set()
+                    for s in self.seeds:
+                        diff = properties_filtered[s] - mean
+                        mahal_sq = np.dot(diff, np.dot(inv_cov, diff))
+                        if np.sqrt(mahal_sq) <= mah_th:
+                            to_remove.add(s)
+                    self.seeds = [s for s in self.seeds if s not in to_remove]
+                else:
+                    if accept_data is not None and 'rejected_spike_indices' in accept_data:
+                        to_remove = set(accept_data['rejected_spike_indices'])
+                        self.seeds = [s for s in self.seeds if s not in to_remove]
+                    else:
+                        seed_orig = seeds_by_density[current_seed_index_ref[0]] if current_seed_index_ref[0] < len(seeds_by_density) else None
+                        if seed_orig is not None:
+                            self.seeds = [s for s in self.seeds if s != seed_orig]
+                self.update_all_plots()
+            finally:
+                self._enable_user_buttons()
+            # Next seed: find next in seeds_by_density that is still in self.seeds
+            next_idx = current_seed_index_ref[0] + 1
+            while next_idx < n_seeds and (seeds_by_density[next_idx] if next_idx < len(seeds_by_density) else None) not in self.seeds:
+                next_idx += 1
+            while next_idx < n_seeds:
+                seed_original = seeds_by_density[next_idx]
+                result = fit_gaussian_model_from_seed(
+                    properties_filtered, seed_original, cluster_dens, self.curr_max_prob, settings
+                )
+                if isinstance(result, dict) and result.get('success', False) and 'model' in result and 'visualization_data' in result:
+                    gaussian_model = result['model']
+                    visualization_data = dict(result['visualization_data'])
+                    all_valid = visualization_data.get('all_valid_indices')
+                    if all_valid is not None:
+                        visualization_data['all_points_full'] = self.all_properties[all_valid].copy()
+                    current_seed_index_ref[0] = next_idx
+                    update_content_fn(visualization_data, gaussian_model, next_idx, n_seeds, seed_original)
+                    if popup.winfo_exists():
+                        self._set_buttons_in_frame_state(popup, tk.NORMAL)
+                    return
+                if isinstance(result, dict) and not result.get('success', False) and settings.get('report_failures', False):
+                    hist = result.get('stability_iteration_history', None)
+                    if hist is not None and len(hist) > 0:
+                        self._show_stability_iteration_debug(hist, result.get('message', 'Model did not reach stability'))
+                    else:
+                        failure_message = result.get('message', 'Unknown failure')
+                        messagebox.showinfo("Seed failed", f"Seed {next_idx + 1}/{n_seeds} failed.\n\n{failure_message}")
+                self.seeds = [s for s in self.seeds if s != seed_original]
+                next_idx += 1
+                while next_idx < n_seeds and (seeds_by_density[next_idx] if next_idx < len(seeds_by_density) else None) not in self.seeds:
+                    next_idx += 1
+            if popup.winfo_exists():
+                popup.destroy()
+            _run_completion()
+
+        single_window_opened = False
+        for seed_idx, seed_original in enumerate(seeds_by_density):
             try:
                 if seed_original not in self.seeds:
                     continue
@@ -4739,7 +4873,6 @@ class GMCSorter:
                             pass
                     prev_fail_viz_popup, prev_fail_viz_fig = None, None
                 
-                cluster_dens = self.cluster_den if self.cluster_den is not None else np.ones(properties_filtered.shape[0], dtype=float)
                 result = fit_gaussian_model_from_seed(
                     properties_filtered,
                     seed_original,  # This should work if properties_filtered maintains row order
@@ -4748,8 +4881,8 @@ class GMCSorter:
                     settings
                 )
                 
-                # Check if successful - handle new format with visualization_data
-                if isinstance(result, dict) and 'model' in result and 'visualization_data' in result:
+                # Check if successful - handle new format with visualization_data (do not show accept/reject when stability failed)
+                if isinstance(result, dict) and result.get('success', False) and 'model' in result and 'visualization_data' in result:
                     gaussian_model = result['model']
                     visualization_data = result['visualization_data']
                     all_valid = visualization_data.get('all_valid_indices')
@@ -4788,78 +4921,95 @@ class GMCSorter:
                         accepted = True
                     else:
                         settings['sort_feature_idx_global'] = self.sort_feature_idx
-                        accepted, accept_data = self._show_accept_reject_mahal_window(
+                        current_seed_index_ref = [seed_idx]
+                        def on_done(accepted, accept_data):
+                            _process_accept_reject(accepted, accept_data, popup, update_content_fn, current_seed_index_ref)
+                        popup, update_content_fn = self._show_accept_reject_mahal_window(
                             visualization_data, gaussian_model, seed_idx, n_seeds, feature_pairs=feature_pairs, settings=settings,
                             initial_model=result.get('initial_model'), properties_for_refit=properties_filtered,
-                            cluster_densities_for_refit=cluster_dens, seed_idx_global=seed_original
+                            cluster_densities_for_refit=cluster_dens, seed_idx_global=seed_original,
+                            on_done_callback=on_done
                         )
-                    if accepted:
-                        # Assign all accepted spikes (including reassigning from other units if this model improves their curr_max_prob)
-                        spike_ids = np.asarray(accept_data['spike_ids'])
-                        if len(spike_ids) > 0:
-                            self.gaussian_models.append(accept_data['model'])
-                            new_unit_label = (max(self.unit_labels) + 1) if self.unit_labels else 0
-                            if self.all_properties is not None and 'y_pos' in self.prop_titles:
-                                y_pos_idx = self.prop_titles.index('y_pos')
-                                mean_y_pos = float(np.mean(self.all_properties[spike_ids, y_pos_idx]))
-                            else:
-                                mean_y_pos = 0.0
+                        single_window_opened = True
+                        break
+                    try:
+                        self._disable_user_buttons()
+                        if accepted:
+                            # Assign all accepted spikes (including reassigning from other units if this model improves their curr_max_prob)
+                            spike_ids = np.asarray(accept_data['spike_ids'])
+                            if len(spike_ids) > 0:
+                                self.gaussian_models.append(accept_data['model'])
+                                new_unit_label = (max(self.unit_labels) + 1) if self.unit_labels else 0
+                                if self.all_properties is not None and 'y_pos' in self.prop_titles:
+                                    y_pos_idx = self.prop_titles.index('y_pos')
+                                    mean_y_pos = float(np.mean(self.all_properties[spike_ids, y_pos_idx]))
+                                else:
+                                    mean_y_pos = 0.0
+                                m = accept_data['model']
+                                unit_vars = [{
+                                    'gaussian': True,
+                                    'feature_indices': list(accept_data['feature_indices']),
+                                    'center': np.array(m.mean, dtype=float).copy(),
+                                    'covariance': np.array(m.covariance, dtype=float).copy(),
+                                    'mah_th': float(m.mah_threshold),
+                                    'bic_th': float(m.bic_threshold),
+                                }]
+                                if m.data_range is not None:
+                                    unit_vars[0]['data_range'] = m.data_range
+                                if m.sort_range is not None:
+                                    unit_vars[0]['sort_range'] = m.sort_range
+                                if accept_data.get('sort_feature_idx_global') is not None:
+                                    unit_vars[0]['sort_feature_idx'] = accept_data['sort_feature_idx_global']
+                                unit = Unit(unit_variables=unit_vars, mean_y_pos=mean_y_pos)
+                                self.unit_info[new_unit_label] = unit
+                                self.unit_labels.append(new_unit_label)
+                                self.unit_labels = sorted(self.unit_labels, key=lambda l: self.unit_info[l].mean_y_pos)
+                                self.unit_id[spike_ids] = new_unit_label
+                                if self.curr_max_prob is not None and 'curr_max_prob_update' in accept_data:
+                                    self.curr_max_prob[spike_ids] = accept_data['curr_max_prob_update']
+                                self._remove_empty_units()
+                                self.unit_combo['values'] = ["new_unit"] + [f"Unit {l}" for l in self.unit_labels]
+                                self._sync_compare_combo_values()
+                                if len(self.unit_labels) > 0:
+                                    self.plot_sorted_check.config(state=tk.NORMAL)
+                            # Remove seeds within accepted model boundary (whether or not we created a unit)
                             m = accept_data['model']
-                            unit_vars = [{
-                                'gaussian': True,
-                                'feature_indices': list(accept_data['feature_indices']),
-                                'center': np.array(m.mean, dtype=float).copy(),
-                                'covariance': np.array(m.covariance, dtype=float).copy(),
-                                'mah_th': float(m.mah_threshold),
-                                'bic_th': float(m.bic_threshold),
-                            }]
-                            if m.data_range is not None:
-                                unit_vars[0]['data_range'] = m.data_range
-                            if m.sort_range is not None:
-                                unit_vars[0]['sort_range'] = m.sort_range
-                            if accept_data.get('sort_feature_idx_global') is not None:
-                                unit_vars[0]['sort_feature_idx'] = accept_data['sort_feature_idx_global']
-                            unit = Unit(unit_variables=unit_vars, mean_y_pos=mean_y_pos)
-                            self.unit_info[new_unit_label] = unit
-                            self.unit_labels.append(new_unit_label)
-                            self.unit_labels = sorted(self.unit_labels, key=lambda l: self.unit_info[l].mean_y_pos)
-                            self.unit_id[spike_ids] = new_unit_label
-                            if self.curr_max_prob is not None and 'curr_max_prob_update' in accept_data:
-                                self.curr_max_prob[spike_ids] = accept_data['curr_max_prob_update']
-                            self._remove_empty_units()
-                            self.unit_combo['values'] = ["new_unit"] + [f"Unit {l}" for l in self.unit_labels]
-                            self._sync_compare_combo_values()
-                            if len(self.unit_labels) > 0:
-                                self.plot_sorted_check.config(state=tk.NORMAL)
-                        # Remove seeds within accepted model boundary (whether or not we created a unit)
-                        m = accept_data['model']
-                        mah_th = float(m.mah_threshold)
-                        mean = m.mean
-                        inv_cov = np.linalg.pinv(m.covariance)
-                        to_remove = set()
-                        for s in self.seeds:
-                            diff = properties_filtered[s] - mean
-                            mahal_sq = np.dot(diff, np.dot(inv_cov, diff))
-                            if np.sqrt(mahal_sq) <= mah_th:
-                                to_remove.add(s)
-                        self.seeds = [s for s in self.seeds if s not in to_remove]
-                    else:
-                        # Rejected: remove all seeds that fall within the rejected model
-                        if accept_data is not None and 'rejected_spike_indices' in accept_data:
-                            to_remove = set(accept_data['rejected_spike_indices'])
+                            mah_th = float(m.mah_threshold)
+                            mean = m.mean
+                            inv_cov = np.linalg.pinv(m.covariance)
+                            to_remove = set()
+                            for s in self.seeds:
+                                diff = properties_filtered[s] - mean
+                                mahal_sq = np.dot(diff, np.dot(inv_cov, diff))
+                                if np.sqrt(mahal_sq) <= mah_th:
+                                    to_remove.add(s)
                             self.seeds = [s for s in self.seeds if s not in to_remove]
                         else:
-                            self.seeds = [s for s in self.seeds if s != seed_original]
+                            # Rejected: remove all seeds that fall within the rejected model
+                            if accept_data is not None and 'rejected_spike_indices' in accept_data:
+                                to_remove = set(accept_data['rejected_spike_indices'])
+                                self.seeds = [s for s in self.seeds if s not in to_remove]
+                            else:
+                                self.seeds = [s for s in self.seeds if s != seed_original]
+                        self.update_all_plots()
+                    finally:
+                        self._enable_user_buttons()
+                    if not accepted:
                         continue
+                    # Let the main window refresh before showing the next seed's window (avoids feeling of immediate close/reopen)
+                    self.root.update_idletasks()
+                    self.root.update()
+                    time.sleep(0.5)
                 
                 # Handle error case (fit failed): remove this seed
                 elif isinstance(result, dict) and not result.get('success', False):
-                    hist = result.get('stability_iteration_history', None)
-                    if hist is not None and len(hist) > 0:
-                        self._show_stability_iteration_debug(hist, result.get('message', 'Model did not reach stability'))
-                    elif settings.get('report_failures', False):
-                        failure_message = result.get('message', 'Unknown failure')
-                        messagebox.showinfo("Seed failed", f"Seed {seed_idx + 1}/{n_seeds} failed.\n\n{failure_message}")
+                    if settings.get('report_failures', False):
+                        hist = result.get('stability_iteration_history', None)
+                        if hist is not None and len(hist) > 0:
+                            self._show_stability_iteration_debug(hist, result.get('message', 'Model did not reach stability'))
+                        else:
+                            failure_message = result.get('message', 'Unknown failure')
+                            messagebox.showinfo("Seed failed", f"Seed {seed_idx + 1}/{n_seeds} failed.\n\n{failure_message}")
                     self.seeds = [s for s in self.seeds if s != seed_original]
                     continue
                 
@@ -4882,21 +5032,8 @@ class GMCSorter:
                 except Exception:
                     pass
 
-        if progress_win is not None and progress_win.winfo_exists():
-            try:
-                progress_bar['value'] = n_seeds
-                progress_label.config(text="Remaining seeds: 0")
-                progress_win.update_idletasks()
-                progress_win.destroy()
-            except tk.TclError:
-                pass
-
-        self.update_all_plots()
-        if self.compute_gaussian_models_button is not None:
-            self.compute_gaussian_models_button.config(state=tk.DISABLED)
-        if len(self.unit_labels) > 0:
-            self.resort_unit_labels_by_position()
-        messagebox.showinfo("Complete", f"Gaussian model computation complete. {len(self.gaussian_models)} models accepted.")
+        if not single_window_opened:
+            _run_completion()
     
     def _show_data_views(self, viz_available_h,viz_bracket_w,n_scatter,popup):
         plot_height = min(viz_available_h, 250)
@@ -4937,19 +5074,76 @@ class GMCSorter:
         canvas = FigureCanvasTkAgg(fig, master=view_inner)
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=False)
         return canvas, axes_flat
-   
+
+    def _set_buttons_in_frame_state(self, parent, state):
+        """Recursively set state (tk.NORMAL or tk.DISABLED) on all Button widgets under parent."""
+        for w in parent.winfo_children():
+            if isinstance(w, (ttk.Button, tk.Button)):
+                try:
+                    w.config(state=state)
+                except tk.TclError:
+                    pass
+            if w.winfo_children():
+                self._set_buttons_in_frame_state(w, state)
+
+    def _disable_user_buttons(self):
+        """Disable all user-action buttons in the toolbar so user cannot interact during processing."""
+        if getattr(self, 'buttons_frame', None) is not None and self.buttons_frame.winfo_exists():
+            self._set_buttons_in_frame_state(self.buttons_frame, tk.DISABLED)
+        if getattr(self, 'calc_densities_btn', None) is not None and self.calc_densities_btn.winfo_exists():
+            try:
+                self.calc_densities_btn.config(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+
+    def _enable_user_buttons(self):
+        """Re-enable toolbar buttons and re-apply conditional states (e.g. compute button when seeds exist)."""
+        if getattr(self, 'buttons_frame', None) is not None and self.buttons_frame.winfo_exists():
+            self._set_buttons_in_frame_state(self.buttons_frame, tk.NORMAL)
+        if getattr(self, 'calc_densities_btn', None) is not None and self.calc_densities_btn.winfo_exists():
+            try:
+                self.calc_densities_btn.config(state=tk.NORMAL if self.all_properties is not None else tk.DISABLED)
+            except tk.TclError:
+                pass
+        # Re-apply conditional states for compute buttons
+        if getattr(self, 'compute_gaussian_models_button', None) is not None and self.compute_gaussian_models_button.winfo_exists():
+            try:
+                self.compute_gaussian_models_button.config(
+                    state=tk.NORMAL if (getattr(self, 'seeds', None) and len(self.seeds) > 0) else tk.DISABLED
+                )
+            except tk.TclError:
+                pass
+        if getattr(self, 'compute_gaussian_models_cluster_btn', None) is not None and self.compute_gaussian_models_cluster_btn.winfo_exists():
+            try:
+                self.compute_gaussian_models_cluster_btn.config(
+                    state=tk.NORMAL if (getattr(self, 'cluster_seeds', None) and len(self.cluster_seeds) > 0) else tk.DISABLED
+                )
+            except tk.TclError:
+                pass
+        if getattr(self, 'delete_cluster_seed_btn', None) is not None and self.delete_cluster_seed_btn.winfo_exists():
+            try:
+                idx = self._get_selected_cluster_seed_index()
+                self.delete_cluster_seed_btn.config(state=tk.NORMAL if idx is not None else tk.DISABLED)
+            except (tk.TclError, Exception):
+                pass
+
     def _show_accept_reject_mahal_window(self, visualization_data, gaussian_model, seed_idx, n_seeds, feature_pairs=None, settings=None,
-                                         initial_model=None, properties_for_refit=None, cluster_densities_for_refit=None, seed_idx_global=None):
+                                         initial_model=None, properties_for_refit=None, cluster_densities_for_refit=None, seed_idx_global=None,
+                                         on_done_callback=None):
         """
         Single window: N-panel Mahal plot (in-cluster=red, out=orange->black) + Size, BIC threshold,
         Re-stabilize, Re-fit model, Accept, Reject. feature_pairs: list of (global_prop_idx_0, global_prop_idx_1).
         initial_model: optional model from _create_init_cluster_from_seed (for Re-stabilize).
         properties_for_refit / cluster_densities_for_refit / seed_idx_global: used for Re-stabilize and Re-fit model.
-        Returns (accepted: bool, accept_data: dict or None).
+        on_done_callback: optional callable(accepted, accept_data). If set, Accept/Reject call it and do not destroy
+            the window; returns (popup, update_content_fn) and no wait_window. update_content_fn(viz, model, seed_idx, n_seeds) updates the window.
+        Returns (accepted: bool, accept_data: dict or None) in modal mode, or (popup, update_content_fn) in reusable mode.
         """
         if self.included_feature_indexes is None or len(self.included_feature_indexes) < 2:
             messagebox.showwarning("Warning", "Cannot show window: need at least 2 included features")
-            return False, None
+            return (False, None) if on_done_callback is None else (None, None)
+        reusable = on_done_callback is not None
+        ref_viz = {'v': visualization_data}
         points = visualization_data['points']
         all_points_full = visualization_data.get('all_points_full')
         seed_point = visualization_data.get('seed_point')
@@ -5001,6 +5195,33 @@ class GMCSorter:
             '_sort_range': getattr(gaussian_model, 'sort_range', None),
             '_sort_feature_idx': getattr(gaussian_model, 'sort_feature_idx', None),
         }
+        ref_state = {'s': state}
+        ref_seed_global = {'g': seed_idx_global}
+
+        def _state_from_viz_model(viz, model):
+            """Build state dict from visualization_data and gaussian_model (for update_content)."""
+            in_b_raw = np.asarray(viz['in_bounds'], dtype=float)
+            if in_b_raw.size == 0 or np.any(np.isnan(in_b_raw)):
+                in_b = np.array([], dtype=int)
+            else:
+                in_b = np.asarray(in_b_raw, dtype=int)
+                n_dw = len(viz['valid_indices'])
+                in_b = in_b[(in_b >= 0) & (in_b < n_dw)]
+            dc = getattr(model, 'density_curve', None)
+            dc = np.asarray(dc, dtype=float) if dc is not None else None
+            return {
+                'center': np.array(model.mean, dtype=float).copy(),
+                'covariance': np.array(model.covariance, dtype=float).copy(),
+                'mahal_d': np.array(viz['mahal_d'], dtype=float).copy(),
+                'mah_th': float(model.mah_threshold),
+                'bic_th': float(getattr(model, 'bic_threshold', bic_th_default)),
+                'density_curve': dc,
+                'in_bounds': in_b,
+                '_data_range': getattr(model, 'data_range', None),
+                '_sort_range': getattr(model, 'sort_range', None),
+                '_sort_feature_idx': getattr(model, 'sort_feature_idx', None),
+            }
+
         result = {'accepted': False, 'accept_data': None}
         popup = tk.Toplevel(self.root)
         popup.title(f"Seed {seed_idx + 1}/{n_seeds} - Accept/Reject Gaussian model")
@@ -5019,215 +5240,244 @@ class GMCSorter:
         
         def re_stabilize():
             """Run iterate_GM_model with current displayed model (and BIC) and user-entered size; if stable, update displayed model."""
-            if properties_for_refit is None or cluster_densities_for_refit is None or seed_idx_global is None:
+            seed_global = ref_seed_global['g']
+            if properties_for_refit is None or cluster_densities_for_refit is None or seed_global is None:
                 messagebox.showwarning("Re-stabilize", "Re-stabilize is not available (e.g. when editing an existing unit).")
                 return
+            st = ref_state['s']
+            viz = ref_viz['v']
             try:
-                new_size = float(mah_th_var.get())
-            except (ValueError, tk.TclError):
-                messagebox.showwarning("Re-stabilize", "Invalid size value.")
-                return
-            # Use current state (so BIC and model from Re-fit are respected), not the original initial_model
-            sort_idx = state.get('_sort_feature_idx')
-            if sort_idx is None:
-                sort_idx = 0
-            model_copy = GaussianModel(
-                mean=state['center'].copy(),
-                covariance=state['covariance'].copy(),
-                mah_threshold=new_size,
-                bic_threshold=state['bic_th'],
-                density_curve=state.get('density_curve'),
-                data_range=state.get('_data_range'),
-                sort_range=state.get('_sort_range'),
-                sort_feature_idx=sort_idx,
-            )
-            if model_copy.data_range is None:
-                model_copy.compute_data_range(properties_for_refit)
-            gm = self.settings.get('gm') or {}
-            init_stds = gm.get('initial_stds')
-            if init_stds is None or len(np.atleast_1d(init_stds)) != state['covariance'].shape[0]:
-                init_stds = np.sqrt(np.maximum(np.diag(state['covariance']), 1e-12))
-            else:
-                init_stds = np.asarray(init_stds, dtype=float).ravel()[: state['covariance'].shape[0]]
-            sort_feature_idx = getattr(model_copy, 'sort_feature_idx', 0)
-            max_range_sorted = float(settings.get('max_range_sorted', gm.get('max_range_sorted', init_stds[sort_feature_idx] * 4.0)))
-            min_change = settings.get('min_change', 0.01)
-            try:
-                outcome, model_out, assignment_out, explode_reason = iterate_GM_model(
-                    properties_for_refit, cluster_densities_for_refit, model_copy, sort_feature_idx, max_range_sorted,
-                    seed_idx_global, min_change=min_change, min_points_for_cluster=min_points_for_cluster,
-                    curr_max_prob=curr_max_prob
+                self._disable_user_buttons()
+                self._set_buttons_in_frame_state(popup, tk.DISABLED)
+                try:
+                    new_size = float(mah_th_var.get())
+                except (ValueError, tk.TclError):
+                    messagebox.showwarning("Re-stabilize", "Invalid size value.")
+                    return
+                sort_idx = st.get('_sort_feature_idx')
+                if sort_idx is None:
+                    sort_idx = 0
+                model_copy = GaussianModel(
+                    mean=st['center'].copy(),
+                    covariance=st['covariance'].copy(),
+                    mah_threshold=new_size,
+                    bic_threshold=st['bic_th'],
+                    density_curve=st.get('density_curve'),
+                    data_range=st.get('_data_range'),
+                    sort_range=st.get('_sort_range'),
+                    sort_feature_idx=sort_idx,
                 )
-            except Exception as e:
-                messagebox.showerror("Re-stabilize", str(e))
-                return
-            if outcome == 'stable':
-                first_idx, last_idx = model_out.data_range
-                valid_indices_new = np.arange(first_idx, last_idx + 1)
-                points_new = properties_for_refit[valid_indices_new]
-                inv_cov = np.linalg.pinv(model_out.covariance)
-                diff_new = points_new - model_out.mean
-                mahal_d_new = np.einsum('ij,jk,ik->i', diff_new, inv_cov, diff_new)**0.5
-                sort_lo, sort_hi = model_out.sort_range
-                width = sort_hi - sort_lo
-                half_extra = 0.25 * width
-                sorted_col = np.asarray(properties_for_refit[:, model_out.sort_feature_idx], dtype=float)
-                viz_first = np.searchsorted(sorted_col, sort_lo - half_extra, side='left')
-                viz_last = np.searchsorted(sorted_col, sort_hi + half_extra, side='right') - 1
-                viz_last = min(max(viz_last, viz_first), len(properties_for_refit) - 1)
-                valid_indices_all_new = np.arange(viz_first, viz_last + 1)
-                points_all_new = properties_for_refit[valid_indices_all_new]
-                visualization_data['points'] = points_new
-                visualization_data['valid_indices'] = valid_indices_new
-                visualization_data['mahal_d'] = mahal_d_new
-                visualization_data['in_bounds'] = np.asarray(assignment_out, dtype=int)
-                visualization_data['all_points'] = points_all_new
-                visualization_data['all_valid_indices'] = valid_indices_all_new
-                if hasattr(self, 'all_properties') and self.all_properties is not None:
-                    visualization_data['all_points_full'] = self.all_properties[valid_indices_all_new].copy()
-                state['center'] = np.array(model_out.mean, dtype=float).copy()
-                state['covariance'] = np.array(model_out.covariance, dtype=float).copy()
-                state['mah_th'] = float(model_out.mah_threshold)
-                state['density_curve'] = getattr(model_out, 'density_curve', None)
-                state['density_curve'] = np.asarray(state['density_curve'], dtype=float) if state['density_curve'] is not None else None
-                state['mahal_d'] = mahal_d_new.copy()
-                state['in_bounds'] = np.asarray(assignment_out, dtype=int)
-                state['_data_range'] = model_out.data_range
-                state['_sort_range'] = getattr(model_out, 'sort_range', None)
-                state['_sort_feature_idx'] = getattr(model_out, 'sort_feature_idx', None)
-                mah_th_var.set(round(float(state['mah_th']), 2))
-                redraw()
-            else:
-                msg = f"Outcome was '{outcome}'."
-                if outcome == 'exploded' and explode_reason:
-                    msg += " " + explode_reason
-                msg += " Model unchanged."
-                messagebox.showwarning("Re-stabilize", msg)
+                if model_copy.data_range is None:
+                    model_copy.compute_data_range(properties_for_refit)
+                gm = self.settings.get('gm') or {}
+                init_stds = gm.get('initial_stds')
+                if init_stds is None or len(np.atleast_1d(init_stds)) != st['covariance'].shape[0]:
+                    init_stds = np.sqrt(np.maximum(np.diag(st['covariance']), 1e-12))
+                else:
+                    init_stds = np.asarray(init_stds, dtype=float).ravel()[: st['covariance'].shape[0]]
+                sort_feature_idx = getattr(model_copy, 'sort_feature_idx', 0)
+                max_range_sorted = float(settings.get('max_range_sorted', gm.get('max_range_sorted', init_stds[sort_feature_idx] * 4.0)))
+                min_change = settings.get('min_change', 0.01)
+                try:
+                    outcome, model_out, assignment_out, explode_reason = iterate_GM_model(
+                        properties_for_refit, cluster_densities_for_refit, model_copy, sort_feature_idx, max_range_sorted,
+                        seed_global, min_change=min_change, min_points_for_cluster=min_points_for_cluster,
+                        curr_max_prob=curr_max_prob
+                    )
+                except Exception as e:
+                    messagebox.showerror("Re-stabilize", str(e))
+                    return
+                if outcome == 'stable':
+                    first_idx, last_idx = model_out.data_range
+                    valid_indices_new = np.arange(first_idx, last_idx + 1)
+                    points_new = properties_for_refit[valid_indices_new]
+                    inv_cov = np.linalg.pinv(model_out.covariance)
+                    diff_new = points_new - model_out.mean
+                    mahal_d_new = np.einsum('ij,jk,ik->i', diff_new, inv_cov, diff_new)**0.5
+                    sort_lo, sort_hi = model_out.sort_range
+                    width = sort_hi - sort_lo
+                    half_extra = 0.25 * width
+                    sorted_col = np.asarray(properties_for_refit[:, model_out.sort_feature_idx], dtype=float)
+                    viz_first = np.searchsorted(sorted_col, sort_lo - half_extra, side='left')
+                    viz_last = np.searchsorted(sorted_col, sort_hi + half_extra, side='right') - 1
+                    viz_last = min(max(viz_last, viz_first), len(properties_for_refit) - 1)
+                    valid_indices_all_new = np.arange(viz_first, viz_last + 1)
+                    points_all_new = properties_for_refit[valid_indices_all_new]
+                    viz['points'] = points_new
+                    viz['valid_indices'] = valid_indices_new
+                    viz['mahal_d'] = mahal_d_new
+                    viz['in_bounds'] = np.asarray(assignment_out, dtype=int)
+                    viz['all_points'] = points_all_new
+                    viz['all_valid_indices'] = valid_indices_all_new
+                    if hasattr(self, 'all_properties') and self.all_properties is not None:
+                        viz['all_points_full'] = self.all_properties[valid_indices_all_new].copy()
+                    st['center'] = np.array(model_out.mean, dtype=float).copy()
+                    st['covariance'] = np.array(model_out.covariance, dtype=float).copy()
+                    st['mah_th'] = float(model_out.mah_threshold)
+                    st['density_curve'] = getattr(model_out, 'density_curve', None)
+                    st['density_curve'] = np.asarray(st['density_curve'], dtype=float) if st['density_curve'] is not None else None
+                    st['mahal_d'] = mahal_d_new.copy()
+                    st['in_bounds'] = np.asarray(assignment_out, dtype=int)
+                    st['_data_range'] = model_out.data_range
+                    st['_sort_range'] = getattr(model_out, 'sort_range', None)
+                    st['_sort_feature_idx'] = getattr(model_out, 'sort_feature_idx', None)
+                    mah_th_var.set(round(float(st['mah_th']), 2))
+                    redraw()
+                else:
+                    msg = f"Outcome was '{outcome}'."
+                    if outcome == 'exploded' and explode_reason:
+                        msg += " " + explode_reason
+                    msg += " Model unchanged."
+                    messagebox.showwarning("Re-stabilize", msg)
+            finally:
+                self._enable_user_buttons()
+                try:
+                    self._set_buttons_in_frame_state(popup, tk.NORMAL)
+                except tk.TclError:
+                    pass
 
         def re_fit_model():
             """Run _create_init_cluster_from_seed with new BIC threshold; if success, replace displayed model."""
-            if properties_for_refit is None or cluster_densities_for_refit is None or seed_idx_global is None:
+            seed_global = ref_seed_global['g']
+            if properties_for_refit is None or cluster_densities_for_refit is None or seed_global is None:
                 messagebox.showwarning("Re-fit model", "Re-fit is not available (e.g. when editing an existing unit).")
                 return
+            st = ref_state['s']
+            viz = ref_viz['v']
             try:
                 new_bic = float(bic_th_var.get())
             except (ValueError, tk.TclError):
                 messagebox.showwarning("Re-fit model", "Invalid BIC threshold value.")
                 return
-            gm = dict(self.settings.get('gm') or {})
-            n_f = properties_for_refit.shape[1]
-            sort_local = gm.get('sorted_feature_idx', 0)
-            if sort_local < 0 or sort_local >= n_f:
-                sort_local = 0
-            init_stds = gm.get('initial_stds')
-            if init_stds is None or len(np.atleast_1d(init_stds)) != n_f:
-                messagebox.showwarning("Re-fit model", "initial_stds must be set in settings and match number of features.")
-                return
-            init_stds = np.asarray(init_stds, dtype=float).ravel()[:n_f]
-            if len(init_stds) < n_f:
-                messagebox.showwarning("Re-fit model", "initial_stds must have one value per feature.")
-                return
-            new_settings = {
-                'sorted_feature_idx': int(sort_local),
-                'min_points_for_cluster': int(gm.get('min_points_for_cluster', 100)),
-                'initial_stds': np.asarray(init_stds, dtype=float),
-                'max_range_sorted': float(gm.get('max_range_sorted', gm.get(f'max_range_{self.prop_titles[self.sort_feature_idx] if getattr(self, "sort_feature_idx", None) is not None and self.sort_feature_idx < len(self.prop_titles) else "sorted feature"}', init_stds[sort_local] * 4.0))),
-                'n_samples_density_curve': int(gm.get('n_samples_density_curve', 101)),
-                'multi_cluster_threshold': new_bic,
-            }
-            for k in ['init_mah_th', 'com_iteration_threshold', 'com_iteration_max_iterations', 'density_threshold_for_init_distance',
-                      'gaussian_filter_sigma', 'dist_step', 'min_change']:
-                if k in gm:
-                    new_settings[k] = gm[k]
-            init_result = _create_init_cluster_from_seed(
-                properties_for_refit, seed_idx_global, cluster_densities_for_refit, curr_max_prob, new_settings
-            )
-            if not init_result['success']:
-                messagebox.showerror("Re-fit model", init_result.get('message', 'Fit failed'))
-                return
-            model = init_result['model']
-            in_bounds_new = init_result['in_bounds']
-            # Run size iteration so displayed model is stabilized (can grow with new BIC), not just the initial boundary
-            model, in_bounds_new, _hist, _hist_full, _stability_failed, _iter_count = _fit_model_size(
-                properties_for_refit, cluster_densities_for_refit, model, in_bounds_new,
-                seed_idx_global, curr_max_prob, new_settings
-            )
-            # One iterate_GM_model run with final model (same as Re-stabilize) so assignment_out
-            # and data_range come from the same run — then use model_out for all viz state
-            sort_feature_idx = getattr(model, 'sort_feature_idx', 0)
-            max_range_sorted = float(new_settings.get('max_range_sorted', init_stds[sort_feature_idx] * 4.0))
-            min_points_for_cluster = int(new_settings.get('min_points_for_cluster', 100))
             try:
-                _outcome, _model_out, assignment_out, _ = iterate_GM_model(
-                    properties_for_refit, cluster_densities_for_refit, model.copy(), sort_feature_idx, max_range_sorted,
-                    seed_idx_global, min_change=new_settings.get('min_change', 0.01),
-                    min_points_for_cluster=min_points_for_cluster, curr_max_prob=curr_max_prob
+                self._disable_user_buttons()
+                self._set_buttons_in_frame_state(popup, tk.DISABLED)
+                gm = dict(self.settings.get('gm') or {})
+                n_f = properties_for_refit.shape[1]
+                sort_local = gm.get('sorted_feature_idx', 0)
+                if sort_local < 0 or sort_local >= n_f:
+                    sort_local = 0
+                init_stds = gm.get('initial_stds')
+                if init_stds is None or len(np.atleast_1d(init_stds)) != n_f:
+                    messagebox.showwarning("Re-fit model", "initial_stds must be set in settings and match number of features.")
+                    return
+                init_stds = np.asarray(init_stds, dtype=float).ravel()[:n_f]
+                if len(init_stds) < n_f:
+                    messagebox.showwarning("Re-fit model", "initial_stds must have one value per feature.")
+                    return
+                new_settings = {
+                    'sorted_feature_idx': int(sort_local),
+                    'min_points_for_cluster': int(gm.get('min_points_for_cluster', 100)),
+                    'initial_stds': np.asarray(init_stds, dtype=float),
+                    'max_range_sorted': float(gm.get('max_range_sorted', gm.get(f'max_range_{self.prop_titles[self.sort_feature_idx] if getattr(self, "sort_feature_idx", None) is not None and self.sort_feature_idx < len(self.prop_titles) else "sorted feature"}', init_stds[sort_local] * 4.0))),
+                    'n_samples_density_curve': int(gm.get('n_samples_density_curve', 101)),
+                    'multi_cluster_threshold': new_bic,
+                }
+                for k in ['init_mah_th', 'com_iteration_threshold', 'com_iteration_max_iterations', 'density_threshold_for_init_distance',
+                          'gaussian_filter_sigma', 'dist_step', 'min_change']:
+                    if k in gm:
+                        new_settings[k] = gm[k]
+                init_result = _create_init_cluster_from_seed(
+                    properties_for_refit, seed_global, cluster_densities_for_refit, curr_max_prob, new_settings
                 )
-                if _outcome == 'stable':
-                    model = _model_out
-            except Exception:
-                pass
-            first_idx, last_idx = model.data_range
-            valid_indices_new = np.arange(first_idx, last_idx + 1)
-            # Red dots from model's in_bounds rule so they always match the displayed model
-            in_bounds_global = model.in_bounds_indices(properties_for_refit, curr_max_prob)
-            in_bounds_for_viz = (in_bounds_global - first_idx).astype(int)
-            in_bounds_for_viz = in_bounds_for_viz[(in_bounds_for_viz >= 0) & (in_bounds_for_viz < len(valid_indices_new))]
-            points_new = properties_for_refit[valid_indices_new]
-            inv_cov = np.linalg.pinv(model.covariance)
-            diff_new = points_new - model.mean
-            mahal_d_new = np.einsum('ij,jk,ik->i', diff_new, inv_cov, diff_new)**0.5
-            sort_lo, sort_hi = model.sort_range
-            width = sort_hi - sort_lo
-            half_extra = 0.25 * width
-            sorted_col = np.asarray(properties_for_refit[:, model.sort_feature_idx], dtype=float)
-            viz_first = np.searchsorted(sorted_col, sort_lo - half_extra, side='left')
-            viz_last = np.searchsorted(sorted_col, sort_hi + half_extra, side='right') - 1
-            viz_last = min(max(viz_last, viz_first), len(properties_for_refit) - 1)
-            valid_indices_all_new = np.arange(viz_first, viz_last + 1)
-            points_all_new = properties_for_refit[valid_indices_all_new]
-            visualization_data['points'] = points_new
-            visualization_data['valid_indices'] = valid_indices_new
-            visualization_data['mahal_d'] = mahal_d_new
-            visualization_data['in_bounds'] = in_bounds_for_viz
-            visualization_data['all_points'] = points_all_new
-            visualization_data['all_valid_indices'] = valid_indices_all_new
-            if hasattr(self, 'all_properties') and self.all_properties is not None:
-                visualization_data['all_points_full'] = self.all_properties[valid_indices_all_new].copy()
-            state['center'] = np.array(model.mean, dtype=float).copy()
-            state['covariance'] = np.array(model.covariance, dtype=float).copy()
-            state['mah_th'] = float(model.mah_threshold)
-            state['bic_th'] = float(model.bic_threshold)
-            state['density_curve'] = getattr(model, 'density_curve', None)
-            state['density_curve'] = np.asarray(state['density_curve'], dtype=float) if state['density_curve'] is not None else None
-            state['mahal_d'] = mahal_d_new.copy()
-            state['in_bounds'] = in_bounds_for_viz.copy()
-            state['_data_range'] = model.data_range
-            state['_sort_range'] = getattr(model, 'sort_range', None)
-            state['_sort_feature_idx'] = getattr(model, 'sort_feature_idx', None)
-            mah_th_var.set(round(float(state['mah_th']), 2))
-            bic_th_var.set(state['bic_th'])
-            redraw()
+                if not init_result['success']:
+                    messagebox.showerror("Re-fit model", init_result.get('message', 'Fit failed'))
+                    return
+                model = init_result['model']
+                in_bounds_new = init_result['in_bounds']
+                # Run size iteration so displayed model is stabilized (can grow with new BIC), not just the initial boundary
+                model, in_bounds_new, _hist, _hist_full, _stability_failed, _iter_count = _fit_model_size(
+                    properties_for_refit, cluster_densities_for_refit, model, in_bounds_new,
+                    seed_global, curr_max_prob, new_settings
+                )
+                # One iterate_GM_model run with final model (same as Re-stabilize) so assignment_out
+                # and data_range come from the same run — then use model_out for all viz state
+                sort_feature_idx = getattr(model, 'sort_feature_idx', 0)
+                max_range_sorted = float(new_settings.get('max_range_sorted', init_stds[sort_feature_idx] * 4.0))
+                min_points_for_cluster = int(new_settings.get('min_points_for_cluster', 100))
+                try:
+                    _outcome, _model_out, assignment_out, _ = iterate_GM_model(
+                        properties_for_refit, cluster_densities_for_refit, model.copy(), sort_feature_idx, max_range_sorted,
+                        seed_global, min_change=new_settings.get('min_change', 0.01),
+                        min_points_for_cluster=min_points_for_cluster, curr_max_prob=curr_max_prob
+                    )
+                    if _outcome == 'stable':
+                        model = _model_out
+                except Exception:
+                    pass
+                first_idx, last_idx = model.data_range
+                valid_indices_new = np.arange(first_idx, last_idx + 1)
+                # Red dots from model's in_bounds rule so they always match the displayed model
+                in_bounds_global = model.in_bounds_indices(properties_for_refit, curr_max_prob)
+                in_bounds_for_viz = (in_bounds_global - first_idx).astype(int)
+                in_bounds_for_viz = in_bounds_for_viz[(in_bounds_for_viz >= 0) & (in_bounds_for_viz < len(valid_indices_new))]
+                points_new = properties_for_refit[valid_indices_new]
+                inv_cov = np.linalg.pinv(model.covariance)
+                diff_new = points_new - model.mean
+                mahal_d_new = np.einsum('ij,jk,ik->i', diff_new, inv_cov, diff_new)**0.5
+                sort_lo, sort_hi = model.sort_range
+                width = sort_hi - sort_lo
+                half_extra = 0.25 * width
+                sorted_col = np.asarray(properties_for_refit[:, model.sort_feature_idx], dtype=float)
+                viz_first = np.searchsorted(sorted_col, sort_lo - half_extra, side='left')
+                viz_last = np.searchsorted(sorted_col, sort_hi + half_extra, side='right') - 1
+                viz_last = min(max(viz_last, viz_first), len(properties_for_refit) - 1)
+                valid_indices_all_new = np.arange(viz_first, viz_last + 1)
+                points_all_new = properties_for_refit[valid_indices_all_new]
+                viz['points'] = points_new
+                viz['valid_indices'] = valid_indices_new
+                viz['mahal_d'] = mahal_d_new
+                viz['in_bounds'] = in_bounds_for_viz
+                viz['all_points'] = points_all_new
+                viz['all_valid_indices'] = valid_indices_all_new
+                if hasattr(self, 'all_properties') and self.all_properties is not None:
+                    viz['all_points_full'] = self.all_properties[valid_indices_all_new].copy()
+                st['center'] = np.array(model.mean, dtype=float).copy()
+                st['covariance'] = np.array(model.covariance, dtype=float).copy()
+                st['mah_th'] = float(model.mah_threshold)
+                st['bic_th'] = float(model.bic_threshold)
+                st['density_curve'] = getattr(model, 'density_curve', None)
+                st['density_curve'] = np.asarray(st['density_curve'], dtype=float) if st['density_curve'] is not None else None
+                st['mahal_d'] = mahal_d_new.copy()
+                st['in_bounds'] = in_bounds_for_viz.copy()
+                st['_data_range'] = model.data_range
+                st['_sort_range'] = getattr(model, 'sort_range', None)
+                st['_sort_feature_idx'] = getattr(model, 'sort_feature_idx', None)
+                mah_th_var.set(round(float(st['mah_th']), 2))
+                bic_th_var.set(st['bic_th'])
+                redraw()
+            finally:
+                self._enable_user_buttons()
+                try:
+                    self._set_buttons_in_frame_state(popup, tk.NORMAL)
+                except tk.TclError:
+                    pass
 
         def redraw():
-            points = visualization_data['points']
-            valid_indices = visualization_data['valid_indices']
-            all_points = visualization_data.get('all_points')
-            all_valid_indices = visualization_data.get('all_valid_indices')
-            mah_th = state['mah_th']
-            in_bounds = state['in_bounds']
-            center = state['center']
-            covariance = state['covariance']
-            mahal_d = state['mahal_d']
+            viz = ref_viz['v']
+            st = ref_state['s']
+            points = viz['points']
+            valid_indices = viz['valid_indices']
+            all_points = viz.get('all_points')
+            all_valid_indices = viz.get('all_valid_indices')
+            mah_th = st['mah_th']
+            in_bounds = st['in_bounds']
+            center = st['center']
+            covariance = st['covariance']
+            mahal_d = st['mahal_d']
             # Use full-window points (assigned + unassigned) when available so sorted spikes show in unit colors
             if all_points is not None and all_valid_indices is not None and all_points.shape[0] == len(all_valid_indices):
                 plot_points = all_points
                 plot_valid_indices = all_valid_indices
-                inv_cov = np.linalg.pinv(covariance)
+                try: 
+                    inv_cov = np.linalg.pinv(covariance)
+                except:
+                    inv_cov = np.ones_like(covariance)
+                    print("Warning: SVD did not converge while computing pseudoinverse.")
                 diff_all = all_points - center
                 mahal_d_plot = np.einsum('ij,jk,ik->i', diff_all, inv_cov, diff_all) ** 0.5
-                # state['in_bounds'] are indices into the data window (valid_indices); map to plot window
-                in_bounds_global = valid_indices[state['in_bounds']]
+                # st['in_bounds'] are indices into the data window (valid_indices); map to plot window
+                in_bounds_global = valid_indices[st['in_bounds']]
                 in_bounds_mask = np.isin(all_valid_indices, in_bounds_global)
                 if unit_id is not None and len(unit_id) > 0 and np.max(all_valid_indices) < len(unit_id):
                     point_unit_ids = unit_id[all_valid_indices]
@@ -5473,33 +5723,42 @@ class GMCSorter:
         bic_entry.pack(side=tk.LEFT, padx=2)
         ttk.Button(ctrl, text="Re-fit model", command=re_fit_model).pack(side=tk.LEFT, padx=2)
         def on_accept():
-            in_b = state['in_bounds']
+            st = ref_state['s']
+            viz = ref_viz['v']
+            in_b = st['in_bounds']
             result['accepted'] = True
-            vind = visualization_data['valid_indices']
-            data_range = state.get('_data_range') or getattr(gaussian_model, 'data_range', None)
-            sort_range = state.get('_sort_range') or getattr(gaussian_model, 'sort_range', None)
-            sort_feat_local = state.get('_sort_feature_idx') or getattr(gaussian_model, 'sort_feature_idx', None)
-            mah_th = state['mah_th']
-            dc = state.get('density_curve')
-            mahal_in_b = state['mahal_d'][in_b]
+            vind = viz['valid_indices']
+            data_range = st.get('_data_range') or getattr(gaussian_model, 'data_range', None)
+            sort_range = st.get('_sort_range') or getattr(gaussian_model, 'sort_range', None)
+            sort_feat_local = st.get('_sort_feature_idx') or getattr(gaussian_model, 'sort_feature_idx', None)
+            mah_th = st['mah_th']
+            dc = st.get('density_curve')
+            mahal_in_b = st['mahal_d'][in_b]
             prob_density_in_b = prob_density_from_curve_or_formula(mahal_in_b, mah_th, density_curve=dc)
             result['accept_data'] = {
                 'spike_ids': vind[in_b],
-                'model': GaussianModel(mean=state['center'], covariance=state['covariance'],
-                                      bic_threshold=state['bic_th'], mah_threshold=state['mah_th'],
+                'model': GaussianModel(mean=st['center'], covariance=st['covariance'],
+                                      bic_threshold=st['bic_th'], mah_threshold=st['mah_th'],
                                       data_range=data_range, sort_range=sort_range, sort_feature_idx=sort_feat_local,
                                       density_curve=dc),
                 'feature_indices': list(included_feat_idxs),
                 'sort_feature_idx_global': settings.get('sort_feature_idx_global') if settings else None,
             }
             result['accept_data']['curr_max_prob_update'] = np.asarray(prob_density_in_b, dtype=float)
-            popup.destroy()
+            if reusable:
+                on_done_callback(True, result['accept_data'])
+            else:
+                popup.destroy()
         def on_reject():
+            st = ref_state['s']
+            viz = ref_viz['v']
             result['accepted'] = False
-            # Return spike indices inside rejected model so caller can remove all of them from seeds
-            rejected_indices = visualization_data['valid_indices'][state['in_bounds']]
+            rejected_indices = viz['valid_indices'][st['in_bounds']]
             result['accept_data'] = {'rejected_spike_indices': np.asarray(rejected_indices).tolist()}
-            popup.destroy()
+            if reusable:
+                on_done_callback(False, result['accept_data'])
+            else:
+                popup.destroy()
         ttk.Button(ctrl, text="Accept", command=on_accept).pack(side=tk.LEFT, padx=5)
         ttk.Button(ctrl, text="Reject", command=on_reject).pack(side=tk.LEFT, padx=5)
 
@@ -5514,9 +5773,22 @@ class GMCSorter:
         w = max(popup.winfo_width(), ctrl.winfo_reqwidth())
         h = popup.winfo_reqheight()
         popup.geometry(f"{w}x{h}")
+
+        def update_content(new_viz, new_model, new_seed_idx, new_n_seeds, new_seed_idx_global):
+            ref_viz['v'] = new_viz
+            ref_state['s'] = _state_from_viz_model(new_viz, new_model)
+            ref_seed_global['g'] = new_seed_idx_global
+            mah_th_var.set(round(float(ref_state['s']['mah_th']), 2))
+            bic_th_var.set(ref_state['s']['bic_th'])
+            popup.title(f"Seed {new_seed_idx + 1}/{new_n_seeds} - Accept/Reject Gaussian model")
+            redraw()
+            canvas_widget.draw()
+
+        if reusable:
+            return popup, update_content
         popup.wait_window()
         return result['accepted'], result['accept_data']
-    
+
     def _show_init_model_debug(self, debug_data, settings):
         """Testing window 1/3: original init model (cov from initial_stds) and in_bounds dots."""
         included_feat_idxs = list(debug_data.get('included_feat_idxs', self.included_feature_indexes or []))

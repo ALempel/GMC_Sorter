@@ -428,7 +428,7 @@ def whiten_data(data, cov, center=None):
     return whitened_data
 
 
-def apply_bic_refinement(points, center, cov, in_bounds, bic_threshold, n_features, min_points_for_cluster=100, max_iter=10, seed_row=None):
+def apply_bic_refinement(points, center, cov, in_bounds, bic_threshold, n_features, min_points_for_cluster=100, max_iter=3, seed_row=None):
     """
     Optionally refine in_bounds by GMM 1 vs 2 BIC; return refined in_bounds (indices into points).
     Data is whitened with the current covariance (and center) so the BIC comparison is in spherical space.
@@ -527,13 +527,14 @@ def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sor
 
     assignment_global = model.in_bounds_indices(properties, curr_max_prob)
     assignment = assignment_global - first_idx
-
+    n_initial_assignment = len(assignment)
     max_inner_iter = 200
     inner_iter = 0
     while True:
         inner_iter += 1
         if inner_iter > max_inner_iter:
-            collapsed = True
+            exploded = True
+            explode_reason = "max iterations exceeded"
             break
         # Save current assignment for length comparison (no index transfer needed)
         previous_assignment = np.copy(assignment)
@@ -574,7 +575,7 @@ def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sor
             points, new_center, new_cov, assignment,
             bic_threshold, n_features,
             min_points_for_cluster=min_points_for_cluster,
-            max_iter=10, seed_row=seed_row
+            max_iter=3, seed_row=seed_row
         )
         bic_did_refine = len(assignment) < n_before_bic
 
@@ -589,7 +590,7 @@ def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sor
         n_prev = len(previous_assignment)
         n_after = len(assignment)
 
-        if n_after < n_prev - min_change * n_prev:
+        if n_after < n_initial_assignment*0.5:
             collapsed = True
             break
         if n_after > n_prev + min_change * n_prev:
@@ -759,7 +760,11 @@ class GaussianModel:
             cmp_slice = current_max_prob[first_idx:last_idx + 1]
         n = window.shape[0]
         diff = window - self.mean
-        inv_cov = np.linalg.pinv(self.covariance)
+        try:
+            inv_cov = np.linalg.pinv(self.covariance)
+        except:
+            return []
+            print("Warning: SVD did not converge while computing pseudoinverse.")
         mahal_d = np.einsum('ij,jk,ik->i', diff, inv_cov, diff) ** 0.5
         mah_th = float(self.mah_threshold)
         within_mah = mahal_d <= mah_th
@@ -995,6 +1000,8 @@ def _create_init_cluster_from_seed(properties, seed_idx, cluster_densities, curr
     min_HC = np.min(rolling_HC)
     crossing_threshold = (rolling_HC[0] * density_threshold_for_init_distance) + min_HC
     stops = np.where(rolling_HC < crossing_threshold)[0]
+    if len(stops) ==  0:
+        return {'success': False, 'message': f'Could not find a stopping point for the density curve'}
     mah_th = mahal_d_s[stops[0]]
     if mah_th < mahal_d_s[0]:
         mah_th = mahal_d_s[0]
@@ -1241,6 +1248,10 @@ def make_gaussian_model_from_cluster(properties, cluster_densities, curr_max_pro
     model, in_bounds, _hist, _hist_full, stability_failed, iter_count = _fit_model_size(
         properties, cluster_densities, model, in_bounds, seed_idx_global, curr_max_prob, settings
     )
+
+    if stability_failed:
+        model = init_result['model'].copy()
+        in_bounds = init_result['in_bounds'].copy()
     first_idx, last_idx = model.data_range
     window_indices = np.arange(first_idx, last_idx + 1)
     points = np.asarray(properties[window_indices, :], dtype=float)
@@ -1288,11 +1299,22 @@ def make_gaussian_model_from_cluster(properties, cluster_densities, curr_max_pro
     debug_after_cb = settings.get('debug_after_gm_callback')
     if callable(debug_after_cb):
         debug_after_cb(viz, model)
-    return {
-        'success': True, 'model': model, 'visualization_data': viz,
-        'window_indices': window_indices, 'cluster_indices': cluster_indices,
-        'seed_idx_local': seed_idx_in_window, 'seed_idx_global': seed_idx_global,
+    model_valid = (
+        np.all(np.isfinite(model.mean)) and
+        np.all(np.isfinite(model.covariance))
+    )
+    out = {
+        'success': (not stability_failed) and model_valid,
+        'model': model,
+        'visualization_data': viz,
+        'window_indices': window_indices,
+        'cluster_indices': cluster_indices,
+        'seed_idx_local': seed_idx_in_window,
+        'seed_idx_global': seed_idx_global,
     }
+    if not model_valid:
+        out['message'] = 'Model has invalid (NaN/inf) mean or covariance'
+    return out
 
 
 def _round_step(x, step):
@@ -1344,7 +1366,7 @@ def _fit_model_size(properties, cluster_densities, model, in_bounds, seed_idx, c
         if outcome in ('collapsed', 'stable'):
             S1 = current_size
             S1_is_stable = (outcome == 'stable')
-            if S2 <= S1 + dist_step:
+            if S2 < S1 + dist_step*1.5:
                 if S1_is_stable:
                     model.mah_threshold = S1
                     model.compute_data_range(properties)
@@ -1377,7 +1399,7 @@ def _fit_model_size(properties, cluster_densities, model, in_bounds, seed_idx, c
         if outcome == 'exploded':
             S2 = min(S2, current_size)
             S2 = _round_step(S2, dist_step)
-            if S2 <= S1 + dist_step:
+            if S2 <= S1 + dist_step*1.5:
                 if S1_is_stable:
                     model.mah_threshold = S1
                     model.compute_data_range(properties)
@@ -1479,6 +1501,9 @@ def fit_gaussian_model_from_seed(properties, seed_idx, cluster_densities, curr_m
     model, in_bounds, iteration_history, iteration_history_full, stability_failed, iter_count = _fit_model_size(
         properties, cluster_densities, init_result['model'], init_result['in_bounds'], seed_idx, curr_max_prob, settings
     )
+    if stability_failed:
+        model = initial_model
+        in_bounds = init_result['in_bounds']
     n_features = properties.shape[1]
     multi_cluster_threshold = settings.get('multi_cluster_threshold', 0.2)
     min_points_for_cluster = int(settings.get('min_points_for_cluster', 100))
@@ -1507,7 +1532,11 @@ def fit_gaussian_model_from_seed(properties, seed_idx, cluster_densities, curr_m
     gaussian_model = model
 
     # Visualization and seed check using final model parameters
-    inv_cov_final = np.linalg.pinv(covs)
+    try:
+        inv_cov_final = np.linalg.pinv(covs)
+    except:
+        inv_cov_final = np.ones_like(covs)
+        print("Warning: SVD did not converge while computing pseudoinverse.")
     diff_final = points - m
     mahal_d_final = np.einsum('ij,jk,ik->i', diff_final, inv_cov_final, diff_final)**0.5
     seed_row_check = np.where(valid_indices == seed_idx)[0]
@@ -1588,15 +1617,21 @@ def fit_gaussian_model_from_seed(properties, seed_idx, cluster_densities, curr_m
         'all_valid_indices': valid_indices_all.copy(),
         'success': not stability_failed,
     }
+    model_valid = (
+        np.all(np.isfinite(gaussian_model.mean)) and
+        np.all(np.isfinite(gaussian_model.covariance))
+    )
     result = {
         'model': gaussian_model,
         'visualization_data': viz,
         'initial_model': initial_model,
+        'success': not stability_failed and model_valid,
     }
     if stability_failed:
-        result['success'] = False
         result['message'] = 'Maximum iterations reached without convergence' if iter_count >= max_iter_for_model else 'model did not reach stability'
         result['stability_iteration_history'] = iteration_history
+    elif not model_valid:
+        result['message'] = 'Model has invalid (NaN/inf) mean or covariance'
 
     # Optional debug callback 3: final model after GM iterations (always show, including on failure)
     debug_gm_cb = settings.get('debug_after_gm_callback')
