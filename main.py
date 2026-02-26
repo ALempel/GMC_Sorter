@@ -1,7 +1,7 @@
 #%%
 Animal_prefix = 'F'
 Animal = '1807'
-Chunk_list = [3] # Empty list to do all chunks
+Chunk_list = [] # Empty list to do all chunks
 probe = 'CNtch_H9'
 file_struct = 'dat_t_s'
 #%%
