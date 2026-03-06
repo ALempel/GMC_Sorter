@@ -3,6 +3,7 @@ import glob
 import math
 import time
 import numpy as np
+from scipy.io import savemat
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -13,7 +14,7 @@ from tkinter import ttk, filedialog, messagebox
 from density_calculation_functions import get_raw_densities, calculate_densities_batch, estimate_grid_batches
 from gmm_sorting_functions import (
     gm_seed_local_max, fit_gaussian_model_from_seed, _create_init_cluster_from_seed, _fit_model_size,
-    make_gaussian_model_from_cluster, iterate_GM_model, GaussianModel, apply_bic_refinement,
+    make_gaussian_model_from_cluster, iterate_GM_model, GaussianModel,
     prob_density_from_curve_or_formula,
 )
 from unit_classes import Bound, Unit
@@ -36,6 +37,7 @@ class GMCSorter:
         self.all_properties = None
         self.prop_titles = None
         self.sort_feature_idx = 0  # Global feature index to sort data by (load-time setting)
+        self._sort_indices = None  # Permutation: current order = original[self._sort_indices]; used to unsort when saving .mat
         self.clust_ind = None
         self.cluster_den = None
         self.background_den = None
@@ -679,7 +681,7 @@ class GMCSorter:
             raise ValueError("background_den must contain only valid (non-negative finite) values or inf")
 
     def _reassign_orphan_spikes_to_other_units(self, orphan_spike_ids, exclude_unit_label):
-        """Assign orphan spikes to remaining units: vectorized for Gaussian (by sorted-dim range + batched mahal), fallback loop for bounded."""
+        """Assign orphan spikes to remaining units. Gaussian: best-wins (max prob_density from curve/formula); bounded: per-spike loop."""
         if not len(orphan_spike_ids) or self.unit_id is None or self.all_properties is None:
             return
         orphan_spike_ids = np.asarray(orphan_spike_ids)
@@ -723,6 +725,7 @@ class GMCSorter:
                 max_std_sorted = 1.0
             margin = 3.0 * max_std_sorted
             range_lo, range_hi = pos_min - margin, pos_max + margin
+            best_unit = np.full(n_orphan, -1, dtype=np.int64)
             for ul, unit in gaussian_units:
                 gv = unit.unit_variables[0]
                 center = np.asarray(gv.get('center'), dtype=float)
@@ -743,13 +746,16 @@ class GMCSorter:
                 mah_sq = np.maximum(mah_sq, 0.0)
                 mah_dist = np.sqrt(mah_sq)
                 density_curve = gv.get('density_curve')
-                prob_density = prob_density_from_curve_or_formula(mah_dist, mah_th, density_curve=density_curve)
+                prob_density = np.asarray(prob_density_from_curve_or_formula(mah_dist, mah_th, density_curve=density_curve), dtype=float)
                 in_bounds = mah_dist <= mah_th
                 improves = in_bounds & (prob_density > max_prob)
                 if np.any(improves):
                     max_prob[improves] = prob_density[improves]
-                    assigned[improves] = True
-                    self.unit_id[orphan_spike_ids[improves]] = ul
+                    best_unit[improves] = ul
+            gaussian_assigned = best_unit >= 0
+            if np.any(gaussian_assigned):
+                assigned[gaussian_assigned] = True
+                self.unit_id[orphan_spike_ids[gaussian_assigned]] = best_unit[gaussian_assigned]
         for ul, unit in bounded_units:
             for i, sid in enumerate(orphan_spike_ids):
                 if assigned[i]:
@@ -950,10 +956,16 @@ class GMCSorter:
         self.sort_feature_idx = new_idx
         sort_indices = np.argsort(self.all_properties[:, new_idx])
         self.all_properties = self.all_properties[sort_indices]
+        if self._sort_indices is not None:
+            self._sort_indices = self._sort_indices[sort_indices]
         if self.clust_ind is not None and len(self.clust_ind) == len(sort_indices):
             self.clust_ind = self.clust_ind[sort_indices]
         if self.unit_id is not None and len(self.unit_id) == len(sort_indices):
             self.unit_id = self.unit_id[sort_indices]
+        if self.cluster_den is not None and len(self.cluster_den) == len(sort_indices):
+            self.cluster_den = self.cluster_den[sort_indices]
+        if self.background_den is not None and len(self.background_den) == len(sort_indices):
+            self.background_den = self.background_den[sort_indices]
         n_spikes = len(sort_indices)
         self._require_curr_max_prob(n_spikes)
         self.curr_max_prob = self.curr_max_prob[sort_indices]
@@ -1028,6 +1040,7 @@ class GMCSorter:
         sort_col = self.sort_feature_idx
         sort_indices = np.argsort(self.all_properties[:, sort_col])
         self.all_properties = self.all_properties[sort_indices]
+        self._sort_indices = sort_indices
 
         # Populate sort-by combo
         if self.sort_feature_combo is not None and self.prop_titles:
@@ -1137,14 +1150,25 @@ class GMCSorter:
         if os.path.exists(densities_file):
             densities_data = np.load(densities_file, allow_pickle=True)
             
-            # Load density arrays WITHOUT sorting - keep original order
+            # Load density arrays; reorder to match current all_properties order if saved order differs
             if 'cluster_den' in densities_data:
                 self.cluster_den = np.array(densities_data['cluster_den'], copy=False)
             if 'background_den' in densities_data:
                 self.background_den = np.array(densities_data['background_den'], copy=False)
             if 'clust_ind' in densities_data:
-                # Load clust_ind without sorting - preserve original order
                 self.clust_ind = np.array(densities_data['clust_ind'], copy=False)
+            # If file has sort_indices and it differs from current, reorder densities to match all_properties
+            n_prop = self.all_properties.shape[0]
+            if 'sort_indices' in densities_data and self.cluster_den is not None and self.cluster_den.shape[0] == n_prop:
+                saved_sort = np.asarray(densities_data['sort_indices'], dtype=int).ravel()
+                if len(saved_sort) == n_prop and not np.array_equal(saved_sort, sort_indices):
+                    inv_saved = np.argsort(saved_sort)
+                    self.cluster_den = np.asarray(self.cluster_den[inv_saved[sort_indices]], order='C')
+                    if self.background_den is not None and self.background_den.shape[0] == n_prop:
+                        self.background_den = np.asarray(self.background_den[inv_saved[sort_indices]], order='C')
+                    if self.clust_ind is not None and self.clust_ind.shape[0] == n_prop:
+                        self.clust_ind = np.asarray(self.clust_ind[inv_saved[sort_indices]], order='C')
+            if self.clust_ind is not None:
                 # Ensure it has the same length as all_properties
                 if self.clust_ind.shape[0] != self.all_properties.shape[0]:
                     messagebox.showwarning("Warning", 
@@ -1364,6 +1388,12 @@ class GMCSorter:
             self._require_curr_max_prob(n_save)
             save_dict['curr_max_prob'] = self.curr_max_prob
             np.savez(os.path.join(self.data_folder, 'sorting.npz'), **save_dict)
+            # Save unit_id (reorganized labels) to MATLAB in original spike order
+            if self._sort_indices is not None and len(self._sort_indices) == n_save:
+                idx_original_order = unit_id_reorganized[np.argsort(self._sort_indices)]
+            else:
+                idx_original_order = unit_id_reorganized
+            savemat(os.path.join(self.data_folder, 'sorting_idx.mat'), {'idx': idx_original_order})
         
         # Data saved successfully
     
@@ -2506,6 +2536,7 @@ class GMCSorter:
         
         del self.unit_info[unit_label]
         self.unit_labels.remove(unit_label)
+        self._reassign_orphan_spikes_to_other_units(su, unit_label)
         
         # Update dropdown and resort labels by position
         if len(self.unit_labels) > 0:
@@ -2524,7 +2555,7 @@ class GMCSorter:
             self.plot_sorted_check.config(state=tk.NORMAL)
     
     def refresh_gm_unit_assignment(self):
-        """Reset all GM-assigned spikes, then re-assign using sorted-dim range, mah distance, and BIC refinement (data whitened by model cov for BIC)."""
+        """Reset all GM-assigned spikes, then re-assign using the same logic as model creation: GaussianModel.in_bounds_indices (with drift when present) and model.bic_refinement."""
         if self.all_properties is None or self.unit_id is None:
             messagebox.showwarning("Refresh", "No data or unit assignments loaded.")
             return
@@ -2535,74 +2566,64 @@ class GMCSorter:
         if not gm_labels:
             messagebox.showinfo("Refresh", "No Gaussian units to refresh.")
             return
+        incl = self.included_feature_indexes
+        if not incl or len(incl) == 0:
+            messagebox.showwarning("Refresh", "No included features set.")
+            return
         reset_mask = np.isin(self.unit_id, gm_labels)
         self.unit_id[reset_mask] = -1
         self.curr_max_prob[reset_mask] = np.where(self.background_den[reset_mask] > 0, self.background_den[reset_mask].astype(float), np.inf)
         settings = self._get_gaussian_model_settings()
         min_points_for_cluster = int(settings.get('min_points_for_cluster', 100)) if settings else 100
-        sorted_global = None
-        if self.included_feature_indexes is not None and len(self.included_feature_indexes) > 0:
-            incl = list(self.included_feature_indexes)
-            if settings is not None and 0 <= settings.get('sorted_feature_idx', -1) < len(incl):
-                sorted_global = int(incl[int(settings['sorted_feature_idx'])])
-            elif self.prop_titles and 'y_pos' in self.prop_titles:
-                sorted_global = self.prop_titles.index('y_pos')
-            else:
-                sorted_global = int(incl[0])
-        if sorted_global is None and self.prop_titles and 'y_pos' in self.prop_titles:
-            sorted_global = self.prop_titles.index('y_pos')
-        if sorted_global is None:
-            messagebox.showwarning("Refresh", "Could not determine sorted dimension.")
-            return
-        sorted_dim_col = self.all_properties[:, sorted_global].astype(float)
-        order = np.argsort(sorted_dim_col)
-        sorted_vals = sorted_dim_col[order]
-        n_features = self.all_properties.shape[1]
+        properties_filtered = np.asarray(self.all_properties[:, incl], dtype=float)
+        t_arr = None
+        if self.prop_titles and 't' in self.prop_titles:
+            t_arr = np.asarray(self.all_properties[:, self.prop_titles.index('t')], dtype=float).ravel()
         for ul in sorted(gm_labels, key=lambda l: self.unit_info[l].mean_y_pos):
             unit = self.unit_info[ul]
             gv = unit.unit_variables[0]
             center = np.asarray(gv.get('center'), dtype=float)
             cov = np.asarray(gv.get('covariance'), dtype=float)
+            if center is None or cov is None or len(center) != len(incl):
+                continue
+            sort_feature_idx_global = gv.get('sort_feature_idx')
+            if sort_feature_idx_global is None or sort_feature_idx_global not in incl:
+                continue
+            sort_feature_idx_local = list(incl).index(sort_feature_idx_global)
             mah_th = float(gv.get('mah_th', 2.0))
             bic_th = float(gv.get('bic_th', 0.2))
-            feat_idx = list(gv.get('feature_indices', []))
-            if not feat_idx or center is None or cov is None or sorted_global not in feat_idx:
-                continue
-            i_sorted = feat_idx.index(sorted_global)
-            center_sorted = float(center[i_sorted])
-            std_sorted = np.sqrt(max(0, float(cov[i_sorted, i_sorted])))
-            if std_sorted <= 0:
-                std_sorted = 1.0
-            range_lo = center_sorted - mah_th * std_sorted
-            range_hi = center_sorted + mah_th * std_sorted
-            left = np.searchsorted(sorted_vals, range_lo, side='left')
-            right = np.searchsorted(sorted_vals, range_hi, side='right')
-            candidate_indices = order[left:right]
-            if len(candidate_indices) == 0:
-                continue
-            points_cand = self.all_properties[candidate_indices][:, np.asarray(feat_idx)].astype(float)
-            diff = points_cand - center
-            inv_cov = np.linalg.pinv(cov)
-            mah_sq = np.einsum('ij,jk,ik->i', diff, inv_cov, diff)
-            mah_sq = np.maximum(mah_sq, 0.0)
-            mah_dist = np.sqrt(mah_sq)
             density_curve = gv.get('density_curve')
-            prob_density = prob_density_from_curve_or_formula(mah_dist, mah_th, density_curve=density_curve)
-            in_bounds = mah_dist <= mah_th
-            improves = in_bounds & (prob_density > self.curr_max_prob[candidate_indices])
-            in_bounds_inds = np.where(improves)[0]
-            if len(in_bounds_inds) < min_points_for_cluster:
-                refined = in_bounds_inds
-            else:
-                refined = apply_bic_refinement(
-                    points_cand, center, cov, in_bounds_inds, bic_th, len(feat_idx),
-                    min_points_for_cluster=min_points_for_cluster, seed_row=None
-                )
-            if len(refined) == 0:
+            flat_density_curve = np.asarray(density_curve, dtype=float) if density_curve is not None else None
+            model = GaussianModel(
+                mean=center, covariance=cov, bic_threshold=bic_th, mah_threshold=mah_th,
+                density_curve=flat_density_curve,
+                drift_correction=gv.get('drift_correction', False),
+                features_to_drift_correct=gv.get('features_to_drift_correct'),
+                n_average=int(gv.get('n_average', 20)),
+            )
+            model.sort_feature_idx = sort_feature_idx_local
+            model.sort_range = gv.get('sort_range')
+            if gv.get('data_range') is not None:
+                model.data_range = tuple(gv['data_range'])
+            if gv.get('t_samples') is not None and gv.get('feature_means') is not None and gv.get('drift_corrected_feats') is not None:
+                model.t_samples = gv['t_samples']
+                model.feature_means = gv['feature_means']
+                model.drift_corrected_feats = gv['drift_corrected_feats']
+            in_bounds_global = model.in_bounds_indices(properties_filtered, self.curr_max_prob, t=t_arr)
+            if getattr(in_bounds_global, 'size', len(in_bounds_global)) == 0:
                 continue
-            final_spike_ids = candidate_indices[refined]
-            self.unit_id[final_spike_ids] = ul
-            self.curr_max_prob[final_spike_ids] = prob_density[refined]
+            in_bounds_global = np.atleast_1d(in_bounds_global)
+            _, refined_global = model.bic_refinement(
+                properties_filtered, in_bounds_global, seed_idx=None, t=t_arr,
+                min_points_for_cluster=min_points_for_cluster, max_iter=3,
+            )
+            if len(refined_global) == 0:
+                continue
+            points_refined = properties_filtered[refined_global]
+            t_refined = t_arr[refined_global] if t_arr is not None else None
+            prob_density = model.prob_density_at(points_refined, t=t_refined)
+            self.unit_id[refined_global] = ul
+            self.curr_max_prob[refined_global] = np.asarray(prob_density, dtype=float).ravel()
         self.update_all_plots()
     
     def edit_selected_unit(self):
@@ -2694,14 +2715,14 @@ class GMCSorter:
         # Seed for Re-stabilize/Re-fit: assigned spike in window closest to unit center (Mahalanobis)
         in_window = np.intersect1d(spike_ids, valid_indices_all)
         seed_idx_global = None
-        initial_model = None
+        edit_settings = None
         if len(in_window) > 0:
             positions = self.all_properties[in_window][:, included_feat_idxs].astype(float)
             inv_cov = np.linalg.pinv(cov_use)
             diff = positions - center_use
             mah_sq = np.einsum('ij,jk,ik->i', diff, inv_cov, diff)
             seed_idx_global = int(in_window[np.argmin(mah_sq)])
-            # Build full GM settings for _create_init_cluster_from_seed (sorted_feature_idx = column index in properties_filtered)
+            # Build full GM settings for re-fit pipeline (same as Re-fit model); use unit BIC, do not overwrite
             sorted_feature_idx_local = included_feat_idxs.index(sorted_feature_idx) if sorted_feature_idx in included_feat_idxs else 0
             edit_gm = dict(self.settings.get('gm') or {})
             init_stds_edit = np.asarray(edit_gm.get('initial_stds', np.sqrt(np.maximum(np.diag(cov_use), 1e-12))))
@@ -2711,19 +2732,15 @@ class GMCSorter:
                 'initial_stds': init_stds_edit,
                 'max_range_sorted': float(edit_gm.get('max_range_sorted', edit_gm.get(f'max_range_{sorted_feature_title}', float(init_stds_edit[sorted_feature_idx_local] * 4.0)))),
                 'n_samples_density_curve': int(edit_gm.get('n_samples_density_curve', 101)),
+                'drift_correction': gv.get('drift_correction', edit_gm.get('drift_correction', False)),
+                'features_to_drift_correct': gv.get('features_to_drift_correct', edit_gm.get('features_to_drift_correct')),
+                'n_average': int(gv.get('n_average', edit_gm.get('n_average', 20))),
             }
             for k in ['init_mah_th', 'com_iteration_threshold', 'com_iteration_max_iterations', 'density_threshold_for_init_distance',
                       'gaussian_filter_sigma', 'dist_step', 'min_change', 'multi_cluster_threshold']:
                 if k in edit_gm:
                     edit_settings[k] = edit_gm[k]
-            n_spikes = self.all_properties.shape[0]
-            self._require_curr_max_prob(n_spikes)
-            cluster_dens = self.cluster_den if self.cluster_den is not None else np.ones(properties_filtered.shape[0], dtype=float)
-            init_result = _create_init_cluster_from_seed(
-                properties_filtered, seed_idx_global, cluster_dens, self.curr_max_prob, edit_settings
-            )
-            if init_result.get('success'):
-                initial_model = init_result['model'].copy()
+            edit_settings['multi_cluster_threshold'] = bic_th  # unit's BIC: do not overwrite when editing
         # Unassign spikes and remove unit (no longer know which data belonged to this unit)
         self.unit_id[spike_ids] = -1
         n_spikes = self.all_properties.shape[0]
@@ -2732,6 +2749,7 @@ class GMCSorter:
         self.curr_max_prob[spike_ids] = np.where(self.background_den[spike_ids] > 0, self.background_den[spike_ids].astype(float), np.inf)
         del self.unit_info[unit_label]
         self.unit_labels.remove(unit_label)
+        self._reassign_orphan_spikes_to_other_units(np.asarray(spike_ids), unit_label)
         if len(self.unit_labels) > 0:
             self.resort_unit_labels_by_position()
         else:
@@ -2740,31 +2758,131 @@ class GMCSorter:
             self.selected_unit.set("new_unit")
             self.compare_unit.set("new_unit")
             self.on_unit_selection_changed()
-        inv_cov = np.linalg.pinv(cov_use)
-        diff = points - center_use
-        mahal_d = np.sqrt(np.einsum('ij,jk,ik->i', diff, inv_cov, diff))
-        density_curve = gv.get('density_curve')
-        prob_density = prob_density_from_curve_or_formula(mahal_d, mah_th, density_curve=density_curve)
-        cmp_slice = self.curr_max_prob[valid_indices_all]
-        in_bounds = np.where(prob_density > cmp_slice)[0]
-        in_bounds = apply_bic_refinement(points, center_use, cov_use, in_bounds, bic_th, n_features, min_points_for_cluster=min_points_for_cluster)
-        HC = self.clust_ind[valid_indices_all].astype(np.float64) if self.clust_ind is not None and len(self.clust_ind) > np.max(valid_indices_all) else np.ones(len(valid_indices_all), dtype=float)
-        visualization_data = {
-            'points': points,
-            'valid_indices': valid_indices_all.copy(),
-            'all_points': points.copy(),
-            'all_valid_indices': valid_indices_all.copy(),
-            'all_points_full': self.all_properties[valid_indices_all].copy(),
-            'center': center_use.copy(),
-            'covariance': cov_use.copy(),
-            'mahal_d': mahal_d,
-            'mah_th': mah_th,
-            'in_bounds': in_bounds,
-            'HC': HC,
-            'seed_point': center_use.copy(),
-            'multi_cluster_threshold': bic_th,
-        }
-        gaussian_model = GaussianModel(mean=center_use, covariance=cov_use, bic_threshold=bic_th, mah_threshold=mah_th)
+        cluster_dens_for_refit = self.cluster_den if self.cluster_den is not None else np.ones(properties_filtered.shape[0], dtype=float)
+        visualization_data = None
+        gaussian_model = None
+        initial_model = None
+        # Same process as Re-fit model: init from seed -> _fit_model_size -> iterate_GM_model (unit BIC already in edit_settings)
+        if seed_idx_global is not None and edit_settings is not None:
+            t_arr_edit = None
+            if hasattr(self, 'prop_titles') and self.prop_titles is not None and 't' in self.prop_titles and hasattr(self, 'all_properties') and self.all_properties is not None:
+                t_arr_edit = np.asarray(self.all_properties[:, self.prop_titles.index('t')], dtype=float).ravel()
+            if t_arr_edit is not None:
+                edit_settings['t'] = t_arr_edit
+            init_result = _create_init_cluster_from_seed(
+                properties_filtered, seed_idx_global, cluster_dens_for_refit, self.curr_max_prob, edit_settings, t=t_arr_edit
+            )
+            if init_result.get('success'):
+                model = init_result['model']
+                in_bounds_new = init_result['in_bounds']
+                model, in_bounds_new, _hist, _hist_full, _stability_failed, _iter_count = _fit_model_size(
+                    properties_filtered, cluster_dens_for_refit, model, in_bounds_new,
+                    seed_idx_global, self.curr_max_prob, edit_settings
+                )
+                init_stds = np.asarray(edit_settings.get('initial_stds'), dtype=float).ravel()[:properties_filtered.shape[1]]
+                sort_feature_idx = getattr(model, 'sort_feature_idx', 0)
+                max_range_sorted = float(edit_settings.get('max_range_sorted', init_stds[sort_feature_idx] * 4.0))
+                min_pts = int(edit_settings.get('min_points_for_cluster', 100))
+                t_arr = t_arr_edit
+                try:
+                    _outcome, _model_out, assignment_out, _ = iterate_GM_model(
+                        properties_filtered, cluster_dens_for_refit, model.copy(), sort_feature_idx, max_range_sorted,
+                        seed_idx_global, min_change=edit_settings.get('min_change', 0.01),
+                        min_points_for_cluster=min_pts, curr_max_prob=self.curr_max_prob, t=t_arr
+                    )
+                    if _outcome == 'stable':
+                        model = _model_out
+                except Exception:
+                    pass
+                first_idx, last_idx = model.data_range
+                valid_indices_new = np.arange(first_idx, last_idx + 1)
+                in_bounds_global = model.in_bounds_indices(properties_filtered, self.curr_max_prob, t=t_arr)
+                in_bounds_for_viz = (in_bounds_global - first_idx).astype(int)
+                in_bounds_for_viz = in_bounds_for_viz[(in_bounds_for_viz >= 0) & (in_bounds_for_viz < len(valid_indices_new))]
+                points_new = properties_filtered[valid_indices_new]
+                inv_cov_m = np.linalg.pinv(model.covariance)
+                diff_new = points_new - model.mean
+                mahal_d_new = np.einsum('ij,jk,ik->i', diff_new, inv_cov_m, diff_new) ** 0.5
+                sort_lo, sort_hi = model.sort_range
+                width = sort_hi - sort_lo
+                half_extra = 0.25 * width
+                sorted_col = np.asarray(properties_filtered[:, model.sort_feature_idx], dtype=float)
+                viz_first = np.searchsorted(sorted_col, sort_lo - half_extra, side='left')
+                viz_last = np.searchsorted(sorted_col, sort_hi + half_extra, side='right') - 1
+                viz_last = min(max(viz_last, viz_first), len(properties_filtered) - 1)
+                valid_indices_all_new = np.arange(viz_first, viz_last + 1)
+                points_all_new = properties_filtered[valid_indices_all_new]
+                HC_new = self.clust_ind[valid_indices_new].astype(np.float64) if self.clust_ind is not None and len(self.clust_ind) > np.max(valid_indices_new) else np.ones(len(valid_indices_new), dtype=float)
+                seed_row_all = np.where(valid_indices_all_new == seed_idx_global)[0]
+                seed_row_in_pts = int(seed_row_all[0]) if len(seed_row_all) > 0 else None
+                seed_row_core = np.where(valid_indices_new == seed_idx_global)[0]
+                seed_row_in_core = int(seed_row_core[0]) if len(seed_row_core) > 0 else None
+                visualization_data = {
+                    'points': points_new,
+                    'valid_indices': valid_indices_new,
+                    'all_points': points_all_new,
+                    'all_valid_indices': valid_indices_all_new,
+                    'all_points_full': self.all_properties[valid_indices_all_new].copy() if self.all_properties is not None else points_all_new.copy(),
+                    'center': np.array(model.mean, dtype=float).copy(),
+                    'covariance': np.array(model.covariance, dtype=float).copy(),
+                    'mahal_d': mahal_d_new,
+                    'mah_th': float(model.mah_threshold),
+                    'in_bounds': in_bounds_for_viz,
+                    'HC': HC_new,
+                    'seed_point': properties_filtered[seed_idx_global].copy() if seed_idx_global < len(properties_filtered) else np.array(model.mean, dtype=float).copy(),
+                    'seed_row_in_points': seed_row_in_pts,
+                    'seed_row_in_core': seed_row_in_core,
+                    'multi_cluster_threshold': float(model.bic_threshold),
+                }
+                gaussian_model = model
+                initial_model = init_result['model'].copy()
+        # Fallback: build viz from unit params (no seed, or init/fit failed)
+        if visualization_data is None:
+            inv_cov = np.linalg.pinv(cov_use)
+            diff = points - center_use
+            mahal_d = np.sqrt(np.einsum('ij,jk,ik->i', diff, inv_cov, diff))
+            density_curve = gv.get('density_curve')
+            prob_density = prob_density_from_curve_or_formula(mahal_d, mah_th, density_curve=density_curve)
+            cmp_slice = self.curr_max_prob[valid_indices_all]
+            in_bounds = np.where(prob_density > cmp_slice)[0]
+            t_fallback = None
+            if hasattr(self, 'prop_titles') and self.prop_titles is not None and 't' in self.prop_titles and self.all_properties is not None and self.all_properties.shape[0] == properties_filtered.shape[0]:
+                t_fallback = np.asarray(self.all_properties[:, self.prop_titles.index('t')], dtype=float).ravel()
+            bic_model = GaussianModel(mean=center_use, covariance=cov_use, bic_threshold=bic_th, mah_threshold=mah_th)
+            _, refined_global = bic_model.bic_refinement(properties_filtered, valid_indices_all[in_bounds], seed_idx=seed_idx_global, t=t_fallback, min_points_for_cluster=min_points_for_cluster, max_iter=3)
+            in_bounds = np.where(np.isin(valid_indices_all, refined_global))[0]
+            HC = self.clust_ind[valid_indices_all].astype(np.float64) if self.clust_ind is not None and len(self.clust_ind) > np.max(valid_indices_all) else np.ones(len(valid_indices_all), dtype=float)
+            seed_row_arr = np.where(valid_indices_all == seed_idx_global)[0] if seed_idx_global is not None else np.array([], dtype=int)
+            seed_row_edit = int(seed_row_arr[0]) if len(seed_row_arr) > 0 else None
+            visualization_data = {
+                'points': points,
+                'valid_indices': valid_indices_all.copy(),
+                'all_points': points.copy(),
+                'all_valid_indices': valid_indices_all.copy(),
+                'all_points_full': self.all_properties[valid_indices_all].copy(),
+                'center': center_use.copy(),
+                'covariance': cov_use.copy(),
+                'mahal_d': mahal_d,
+                'mah_th': mah_th,
+                'in_bounds': in_bounds,
+                'HC': HC,
+                'seed_point': properties_filtered[seed_idx_global].copy() if (seed_idx_global is not None and seed_idx_global < len(properties_filtered)) else center_use.copy(),
+                'seed_row_in_points': seed_row_edit,
+                'seed_row_in_core': seed_row_edit,
+                'multi_cluster_threshold': bic_th,
+            }
+            n_samples_density_curve = int(gm.get('n_samples_density_curve', 101))
+            if seed_idx_global is not None and self.cluster_den is not None and seed_idx_global < len(self.cluster_den):
+                seed_cluster_density = float(self.cluster_den[seed_idx_global])
+                flat_density_curve = np.full(n_samples_density_curve, seed_cluster_density, dtype=float)
+            else:
+                flat_density_curve = np.asarray(gv.get('density_curve'), dtype=float) if gv.get('density_curve') is not None else None
+            gaussian_model = GaussianModel(mean=center_use, covariance=cov_use, bic_threshold=bic_th, mah_threshold=mah_th, density_curve=flat_density_curve,
+                                          drift_correction=gv.get('drift_correction', False), features_to_drift_correct=gv.get('features_to_drift_correct'), n_average=int(gv.get('n_average', 20)))
+            if gv.get('t_samples') is not None and gv.get('feature_means') is not None and gv.get('drift_corrected_feats') is not None:
+                gaussian_model.t_samples = gv['t_samples']
+                gaussian_model.feature_means = gv['feature_means']
+                gaussian_model.drift_corrected_feats = gv['drift_corrected_feats']
         if gm and 'viz_feature_pairs' in gm and hasattr(gm['viz_feature_pairs'], '__len__') and len(gm['viz_feature_pairs']) >= 1:
             viz_pairs = [(int(p[0]), int(p[1])) for p in gm['viz_feature_pairs']]
         else:
@@ -2772,12 +2890,12 @@ class GMCSorter:
                          (included_feat_idxs[0], included_feat_idxs[min(2, len(included_feat_idxs)-1)]),
                          (included_feat_idxs[min(3, len(included_feat_idxs)-1)], included_feat_idxs[min(4, len(included_feat_idxs)-1)]),
                          (included_feat_idxs[0], included_feat_idxs[min(5, len(included_feat_idxs)-1)])]
-        cluster_dens_for_refit = self.cluster_den if self.cluster_den is not None else np.ones(properties_filtered.shape[0], dtype=float)
         settings = {
             'unit_id': self.unit_id,
             'curr_max_prob': self.curr_max_prob,
             'viz_feature_pairs': viz_pairs,
             'min_points_for_cluster': min_points_for_cluster,
+            'n_average': int(gm.get('n_average', 20)) if gm else 20,
         }
         accepted, accept_data = self._show_accept_reject_mahal_window(
             visualization_data, gaussian_model, seed_idx=0, n_seeds=1, feature_pairs=settings['viz_feature_pairs'], settings=settings,
@@ -2811,6 +2929,13 @@ class GMCSorter:
                     unit_vars[0]['sort_range'] = m.sort_range
                 if accept_data.get('sort_feature_idx_global') is not None:
                     unit_vars[0]['sort_feature_idx'] = accept_data['sort_feature_idx_global']
+                unit_vars[0]['drift_correction'] = getattr(m, 'drift_correction', False)
+                unit_vars[0]['features_to_drift_correct'] = getattr(m, 'features_to_drift_correct', None)
+                unit_vars[0]['n_average'] = getattr(m, 'n_average', 20)
+                if getattr(m, 't_samples', None) is not None:
+                    unit_vars[0]['t_samples'] = m.t_samples
+                    unit_vars[0]['feature_means'] = m.feature_means
+                    unit_vars[0]['drift_corrected_feats'] = m.drift_corrected_feats
                 new_unit = Unit(unit_variables=unit_vars, mean_y_pos=mean_y_pos)
                 self.unit_info[new_unit_label] = new_unit
                 self.unit_labels.append(new_unit_label)
@@ -3233,6 +3358,8 @@ class GMCSorter:
         if settings is None:
             messagebox.showwarning("Compute Gaussian Models", "Could not get Gaussian model settings.")
             return
+        if hasattr(self, 'prop_titles') and self.prop_titles is not None and 't' in self.prop_titles and self.all_properties is not None:
+            settings['t'] = np.asarray(self.all_properties[:, self.prop_titles.index('t')], dtype=float).ravel()
         gm = self.settings.get('gm') or {}
         if 'viz_feature_pairs' in gm and hasattr(gm['viz_feature_pairs'], '__len__') and len(gm['viz_feature_pairs']) >= 1:
             viz_pairs = [(int(p[0]), int(p[1])) for p in gm['viz_feature_pairs']]
@@ -3247,6 +3374,9 @@ class GMCSorter:
             'curr_max_prob': self.curr_max_prob,
             'viz_feature_pairs': viz_pairs,
             'min_points_for_cluster': settings.get('min_points_for_cluster', 100),
+            'n_average': int(settings.get('n_average', 20)),
+            'drift_correction': settings.get('drift_correction', False),
+            'features_to_drift_correct': settings.get('features_to_drift_correct'),
         }
         # Order seeds by cluster density (highest first): mean density at seed spike_ids
         def _seed_mean_density(cs):
@@ -3277,7 +3407,10 @@ class GMCSorter:
             # In-bounds: same convention as Re-stabilize/Re-fit — valid_indices = global data-window indices, in_bounds = 0-based into that window
             first_global = int(valid_indices_global[0])
             last_global = int(valid_indices_global[-1])
-            in_bounds_global = gaussian_model.in_bounds_indices(properties_filtered, self.curr_max_prob)
+            t_arr = None
+            if hasattr(self, 'prop_titles') and self.prop_titles is not None and 't' in self.prop_titles and hasattr(self, 'all_properties') and self.all_properties is not None:
+                t_arr = np.asarray(self.all_properties[:, self.prop_titles.index('t')], dtype=float).ravel()
+            in_bounds_global = gaussian_model.in_bounds_indices(properties_filtered, self.curr_max_prob, t=t_arr)
             in_bounds = (in_bounds_global[(in_bounds_global >= first_global) & (in_bounds_global <= last_global)] - first_global).astype(int)
             # Build viz window in full properties_filtered space (sort_range + margin) so we show all dots in range
             sort_lo, sort_hi = gaussian_model.sort_range
@@ -3290,6 +3423,8 @@ class GMCSorter:
             all_valid_indices_global = np.arange(viz_first, viz_last + 1)
             seed_row_in_points_arr = np.where(all_valid_indices_global == seed_idx_global)[0]
             seed_row_in_points = int(seed_row_in_points_arr[0]) if len(seed_row_in_points_arr) > 0 else None
+            seed_row_in_core_arr = np.where(valid_indices_global == seed_idx_global)[0]
+            seed_row_in_core = int(seed_row_in_core_arr[0]) if len(seed_row_in_core_arr) > 0 else None
             points_data = properties_filtered[valid_indices_global]
             inv_cov = np.linalg.pinv(gaussian_model.covariance)
             mahal_d_data = np.einsum('ij,jk,ik->i', points_data - gaussian_model.mean, inv_cov, points_data - gaussian_model.mean) ** 0.5
@@ -3304,8 +3439,9 @@ class GMCSorter:
                 'center': gaussian_model.mean.copy(),
                 'covariance': gaussian_model.covariance.copy(),
                 'HC': cluster_dens[all_valid_indices_global] if cluster_dens is not None else np.ones(len(all_valid_indices_global), dtype=float),
-                'seed_point': properties_filtered[seed_idx_global].copy() if seed_idx_global < len(properties_filtered) else viz['seed_point'].copy(),
+                'seed_point': properties_filtered[seed_idx_global].copy() if seed_idx_global < len(properties_filtered) else gaussian_model.mean.copy(),
                 'seed_row_in_points': seed_row_in_points,
+                'seed_row_in_core': seed_row_in_core,
                 'multi_cluster_threshold': viz['multi_cluster_threshold'],
             }
             accepted, accept_data = self._show_accept_reject_mahal_window(
@@ -3345,6 +3481,13 @@ class GMCSorter:
                             unit_vars[0]['sort_range'] = m.sort_range
                         if accept_data.get('sort_feature_idx_global') is not None:
                             unit_vars[0]['sort_feature_idx'] = accept_data['sort_feature_idx_global']
+                        unit_vars[0]['drift_correction'] = getattr(m, 'drift_correction', False)
+                        unit_vars[0]['features_to_drift_correct'] = getattr(m, 'features_to_drift_correct', None)
+                        unit_vars[0]['n_average'] = getattr(m, 'n_average', 20)
+                        if getattr(m, 't_samples', None) is not None:
+                            unit_vars[0]['t_samples'] = m.t_samples
+                            unit_vars[0]['feature_means'] = m.feature_means
+                            unit_vars[0]['drift_corrected_feats'] = m.drift_corrected_feats
                         new_unit = Unit(unit_variables=unit_vars, mean_y_pos=mean_y_pos)
                         self.unit_info[new_unit_label] = new_unit
                         self.unit_labels.append(new_unit_label)
@@ -3940,14 +4083,17 @@ class GMCSorter:
             else:
                 self.clust_ind = None
             
-            # Save densities
+            # Save densities (order matches all_properties; save sort_indices so load can reorder if needed)
             if self.data_folder:
                 densities_file = os.path.join(self.data_folder, 'densities.npz')
-                np.savez(densities_file,
-                        cluster_den=self.cluster_den,
-                        background_den=self.background_den,
-                        clust_ind=self.clust_ind,
-                        included_feature_indexes=np.array(included_feature_indexes))
+                save_kw = dict(
+                    cluster_den=self.cluster_den,
+                    background_den=self.background_den,
+                    clust_ind=self.clust_ind,
+                    included_feature_indexes=np.array(included_feature_indexes))
+                if self._sort_indices is not None and len(self._sort_indices) == len(self.cluster_den):
+                    save_kw['sort_indices'] = self._sort_indices
+                np.savez(densities_file, **save_kw)
             
             # Close progress window
             progress_window.destroy()
@@ -3966,7 +4112,7 @@ class GMCSorter:
     
     def find_local_maxima_seeds(self):
         """Find local maxima seeds"""
-        if self.clust_ind is None:
+        if self.clust_ind is None or self.cluster_den is None:
             messagebox.showerror("Error", "Please calculate densities first")
             return
         
@@ -4137,6 +4283,7 @@ class GMCSorter:
                 self.seeds = gm_seed_local_max(
                     self.all_properties,
                     self.clust_ind,
+                    self.cluster_den,
                     spikes_per_batch / 1000.0,  # Convert to thousands
                     min_cluster_idx,
                     feature_distances,
@@ -4181,6 +4328,8 @@ class GMCSorter:
         settings = self._get_gaussian_model_settings()
         if settings is None:
             return
+        if hasattr(self, 'prop_titles') and self.prop_titles is not None and 't' in self.prop_titles and self.all_properties is not None:
+            settings['t'] = np.asarray(self.all_properties[:, self.prop_titles.index('t')], dtype=float).ravel()
         included_feat_idxs = self.included_feature_indexes
         properties_filtered = self.all_properties[:, included_feat_idxs]
         self._compute_gaussian_models_loop(properties_filtered, settings)
@@ -4236,6 +4385,12 @@ class GMCSorter:
         elif 'viz_feature_pairs' in defaults_dict and hasattr(defaults_dict['viz_feature_pairs'], '__len__') and len(defaults_dict['viz_feature_pairs']) >= 1:
             raw = defaults_dict['viz_feature_pairs']
             viz_pairs = [(int(p[0]), int(p[1])) for p in raw]
+        def _features_to_drift_correct_from_defaults(d, n_inc, sort_idx_included):
+            """sort_idx_included: sorted feature's index in included-feature space (0..n_inc-1), from included_feat_idxs.index(self.sort_feature_idx)."""
+            if 'features_to_drift_correct' not in d or d['features_to_drift_correct'] is None:
+                return [sort_idx_included] if n_inc > 0 else []
+            arr = np.atleast_1d(np.asarray(d['features_to_drift_correct'], dtype=int)).ravel()
+            return list(np.unique(np.clip(arr, 0, n_inc - 1).astype(int))) if n_inc > 0 else []
         settings = {
             'initial_stds': initial_stds,
             'max_range_sorted': max_range_sorted,
@@ -4254,6 +4409,9 @@ class GMCSorter:
             'viz_feature_pairs': viz_pairs,
             'report_failures': bool(defaults_dict.get('report_failures', False)),
             'skip_user_refinement': bool(defaults_dict.get('skip_user_refinement', False)),
+            'features_to_drift_correct': _features_to_drift_correct_from_defaults(defaults_dict, n_included, sorted_feature_idx),
+            'n_average': int(defaults_dict.get('n_average', 20)),
+            'drift_correction': bool(defaults_dict.get('default_drift_correction', False)),
         }
         return settings
     
@@ -4407,6 +4565,86 @@ class GMCSorter:
             var = tk.IntVar(value=int(defaults_dict.get(key, default_val))) if use_int else tk.DoubleVar(value=defaults_dict.get(key, default_val))
             ttk.Entry(row, textvariable=var, width=12).pack(side=tk.LEFT, padx=2)
             settings_vars[key] = var
+
+        # Drift correction: features to drift-correct (indices in included-feature space)
+        sorted_feature_idx_local = included_feat_idxs.index(self.sort_feature_idx) if self.sort_feature_idx in included_feat_idxs else 0
+        saved_drift = defaults_dict.get('features_to_drift_correct', None)
+        if saved_drift is not None and hasattr(saved_drift, '__len__'):
+            drift_default = list(np.unique(np.clip(np.atleast_1d(np.asarray(saved_drift, dtype=int)).ravel(), 0, n_included - 1).astype(int))) if n_included > 0 else []
+        else:
+            drift_default = [sorted_feature_idx_local] if n_included > 0 else []
+        included_feature_names = [self.prop_titles[included_feat_idxs[i]] if included_feat_idxs[i] < len(self.prop_titles) else f"Feat {included_feat_idxs[i]}" for i in range(n_included)]
+        drift_frame = ttk.LabelFrame(scrollable_frame, text="Drift correction (features to correct)", padding="5")
+        drift_frame.pack(fill=tk.X, padx=5, pady=5)
+        row_default_drift = ttk.Frame(drift_frame)
+        row_default_drift.pack(fill=tk.X, pady=2)
+        settings_vars['default_drift_correction'] = tk.BooleanVar(value=bool(defaults_dict.get('default_drift_correction', False)))
+        ttk.Checkbutton(row_default_drift, text="Default drift correction (new models start with drift correction on)", variable=settings_vars['default_drift_correction']).pack(side=tk.LEFT, padx=(0, 5))
+        row_n_avg = ttk.Frame(drift_frame)
+        row_n_avg.pack(fill=tk.X, pady=2)
+        ttk.Label(row_n_avg, text="Samples to average:").pack(side=tk.LEFT, padx=(0, 5))
+        settings_vars['n_average'] = tk.IntVar(value=int(defaults_dict.get('n_average', 20)))
+        ttk.Entry(row_n_avg, textvariable=settings_vars['n_average'], width=10).pack(side=tk.LEFT, padx=2)
+        drift_row = ttk.Frame(drift_frame)
+        drift_row.pack(fill=tk.X, pady=2)
+        ttk.Label(drift_row, text="Included features:").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(drift_row, text="Features to drift-correct:").pack(side=tk.LEFT, padx=(20, 8))
+        list_row = ttk.Frame(drift_frame)
+        list_row.pack(fill=tk.X, pady=2)
+        list_included = tk.Listbox(list_row, height=4, width=22, selectmode=tk.SINGLE, exportselection=False)
+        list_included.pack(side=tk.LEFT, padx=(0, 5))
+        list_drift = tk.Listbox(list_row, height=4, width=22, selectmode=tk.SINGLE, exportselection=False)
+        list_drift.pack(side=tk.LEFT, padx=(0, 5))
+        settings_vars['_drift_list_included'] = list_included
+        settings_vars['_drift_list_drift'] = list_drift
+        settings_vars['_drift_included_names'] = included_feature_names
+        settings_vars['features_to_drift_correct'] = list(drift_default)
+
+        def _refresh_included_list():
+            """Show only included features that are not in the drift-correct list (move back and forth)."""
+            list_included.delete(0, tk.END)
+            for i in range(len(included_feature_names)):
+                if i not in settings_vars['features_to_drift_correct']:
+                    list_included.insert(tk.END, included_feature_names[i])
+
+        def _refresh_drift_list():
+            list_drift.delete(0, tk.END)
+            for idx in settings_vars['features_to_drift_correct']:
+                if 0 <= idx < len(included_feature_names):
+                    list_drift.insert(tk.END, included_feature_names[idx])
+
+        def _drift_add():
+            sel = list_included.curselection()
+            if not sel:
+                return
+            name = list_included.get(sel[0])
+            if name not in included_feature_names:
+                return
+            i = included_feature_names.index(name)
+            if i not in settings_vars['features_to_drift_correct']:
+                settings_vars['features_to_drift_correct'].append(i)
+                settings_vars['features_to_drift_correct'].sort()
+                _refresh_drift_list()
+                _refresh_included_list()
+
+        def _drift_remove():
+            sel = list_drift.curselection()
+            if not sel:
+                return
+            name = list_drift.get(sel[0])
+            if name in included_feature_names:
+                idx = included_feature_names.index(name)
+                if idx in settings_vars['features_to_drift_correct']:
+                    settings_vars['features_to_drift_correct'].remove(idx)
+                    _refresh_drift_list()
+                    _refresh_included_list()
+
+        btn_row = ttk.Frame(drift_frame)
+        btn_row.pack(fill=tk.X, pady=2)
+        ttk.Button(btn_row, text="+ Add", command=_drift_add).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_row, text="- Remove", command=_drift_remove).pack(side=tk.LEFT, padx=2)
+        _refresh_included_list()
+        _refresh_drift_list()
 
         # Views for user inspections: variable number of plots (x, y by property)
         all_prop_titles = list(self.prop_titles) if self.prop_titles else [f"Feature {i}" for i in range(self.all_properties.shape[1])]
@@ -4663,6 +4901,9 @@ class GMCSorter:
             settings['viz_feature_pairs'] = viz_pairs
             settings['report_failures'] = bool(settings_vars['report_failures'].get())
             settings['skip_user_refinement'] = bool(settings_vars['skip_user_refinement'].get())
+            settings['features_to_drift_correct'] = list(settings_vars['features_to_drift_correct'])
+            settings['n_average'] = int(settings_vars['n_average'].get())
+            settings['default_drift_correction'] = bool(settings_vars['default_drift_correction'].get())
             return settings
 
         def on_close():
@@ -4779,6 +5020,13 @@ class GMCSorter:
                             unit_vars[0]['sort_range'] = m.sort_range
                         if accept_data.get('sort_feature_idx_global') is not None:
                             unit_vars[0]['sort_feature_idx'] = accept_data['sort_feature_idx_global']
+                        unit_vars[0]['drift_correction'] = getattr(m, 'drift_correction', False)
+                        unit_vars[0]['features_to_drift_correct'] = getattr(m, 'features_to_drift_correct', None)
+                        unit_vars[0]['n_average'] = getattr(m, 'n_average', 20)
+                        if getattr(m, 't_samples', None) is not None:
+                            unit_vars[0]['t_samples'] = m.t_samples
+                            unit_vars[0]['feature_means'] = m.feature_means
+                            unit_vars[0]['drift_corrected_feats'] = m.drift_corrected_feats
                         unit = Unit(unit_variables=unit_vars, mean_y_pos=mean_y_pos)
                         self.unit_info[new_unit_label] = unit
                         self.unit_labels.append(new_unit_label)
@@ -4884,10 +5132,33 @@ class GMCSorter:
                 # Check if successful - handle new format with visualization_data (do not show accept/reject when stability failed)
                 if isinstance(result, dict) and result.get('success', False) and 'model' in result and 'visualization_data' in result:
                     gaussian_model = result['model']
-                    visualization_data = result['visualization_data']
+                    # Build visualization_data in the same structure as re-fit: core window for points/valid_indices/in_bounds/mahal_d, wider for all_*
+                    _raw_viz = result['visualization_data']
+                    vind_all = np.asarray(_raw_viz['valid_indices'], dtype=int)
+                    in_b_all = np.asarray(_raw_viz['in_bounds'], dtype=int)
+                    n_dw = len(vind_all)
+                    in_b_all = in_b_all[(in_b_all >= 0) & (in_b_all < n_dw)]
+                    first_idx, last_idx = gaussian_model.data_range
+                    valid_indices_core = np.arange(first_idx, last_idx + 1, dtype=int)
+                    in_bounds_global = vind_all[in_b_all]
+                    in_bounds_core = np.where(np.isin(valid_indices_core, in_bounds_global))[0].astype(int)
+                    points_core = properties_filtered[valid_indices_core]
+                    inv_cov = np.linalg.pinv(gaussian_model.covariance)
+                    diff_core = points_core - gaussian_model.mean
+                    mahal_d_core = np.einsum('ij,jk,ik->i', diff_core, inv_cov, diff_core) ** 0.5
+                    viz_first = int(vind_all[0])
+                    core_lo = first_idx - viz_first
+                    core_hi = last_idx - viz_first + 1
+                    HC_core = np.asarray(_raw_viz['HC'], dtype=float)[core_lo:core_hi] if 'HC' in _raw_viz and core_hi <= len(_raw_viz['HC']) else np.ones(len(valid_indices_core), dtype=float)
+                    visualization_data = dict(_raw_viz)
+                    visualization_data['points'] = points_core
+                    visualization_data['valid_indices'] = valid_indices_core
+                    visualization_data['in_bounds'] = in_bounds_core
+                    visualization_data['mahal_d'] = mahal_d_core
+                    visualization_data['HC'] = HC_core
                     all_valid = visualization_data.get('all_valid_indices')
                     if all_valid is not None:
-                        visualization_data = dict(visualization_data)
+                        visualization_data['all_valid_indices'] = np.asarray(all_valid, dtype=int).copy()
                         visualization_data['all_points_full'] = self.all_properties[all_valid].copy()
                     feature_pairs = settings.get('viz_feature_pairs', [(0, 1), (0, 2), (3, 4), (0, 5)])
                     if skip_refinement:
@@ -4960,6 +5231,13 @@ class GMCSorter:
                                     unit_vars[0]['sort_range'] = m.sort_range
                                 if accept_data.get('sort_feature_idx_global') is not None:
                                     unit_vars[0]['sort_feature_idx'] = accept_data['sort_feature_idx_global']
+                                unit_vars[0]['drift_correction'] = getattr(m, 'drift_correction', False)
+                                unit_vars[0]['features_to_drift_correct'] = getattr(m, 'features_to_drift_correct', None)
+                                unit_vars[0]['n_average'] = getattr(m, 'n_average', 20)
+                                if getattr(m, 't_samples', None) is not None:
+                                    unit_vars[0]['t_samples'] = m.t_samples
+                                    unit_vars[0]['feature_means'] = m.feature_means
+                                    unit_vars[0]['drift_corrected_feats'] = m.drift_corrected_feats
                                 unit = Unit(unit_variables=unit_vars, mean_y_pos=mean_y_pos)
                                 self.unit_info[new_unit_label] = unit
                                 self.unit_labels.append(new_unit_label)
@@ -5011,6 +5289,13 @@ class GMCSorter:
                             failure_message = result.get('message', 'Unknown failure')
                             messagebox.showinfo("Seed failed", f"Seed {seed_idx + 1}/{n_seeds} failed.\n\n{failure_message}")
                     self.seeds = [s for s in self.seeds if s != seed_original]
+                    continue
+                else:
+                    # Result None, not a dict, or success but missing model/viz: remove seed so we don't retry
+                    self.seeds = [s for s in self.seeds if s != seed_original]
+                    if settings.get('report_failures', False):
+                        msg = result.get('message', 'Invalid or missing result') if isinstance(result, dict) else (str(result) if result is not None else 'Fit returned no result')
+                        messagebox.showinfo("Seed failed", f"Seed {seed_idx + 1}/{n_seeds} failed.\n\n{msg}")
                     continue
                 
             except Exception as e:
@@ -5135,6 +5420,8 @@ class GMCSorter:
         Re-stabilize, Re-fit model, Accept, Reject. feature_pairs: list of (global_prop_idx_0, global_prop_idx_1).
         initial_model: optional model from _create_init_cluster_from_seed (for Re-stabilize).
         properties_for_refit / cluster_densities_for_refit / seed_idx_global: used for Re-stabilize and Re-fit model.
+        properties_for_refit is all_properties[:, included_feature_indexes] (included features only); row order must match all_properties.
+        Re-stabilize/Re-fit refresh these from current self so that invariant always holds.
         on_done_callback: optional callable(accepted, accept_data). If set, Accept/Reject call it and do not destroy
             the window; returns (popup, update_content_fn) and no wait_window. update_content_fn(viz, model, seed_idx, n_seeds) updates the window.
         Returns (accepted: bool, accept_data: dict or None) in modal mode, or (popup, update_content_fn) in reusable mode.
@@ -5194,9 +5481,13 @@ class GMCSorter:
             '_data_range': getattr(gaussian_model, 'data_range', None),
             '_sort_range': getattr(gaussian_model, 'sort_range', None),
             '_sort_feature_idx': getattr(gaussian_model, 'sort_feature_idx', None),
+            'drift_correction': getattr(gaussian_model, 'drift_correction', False),
+            'features_to_drift_correct': getattr(gaussian_model, 'features_to_drift_correct', None),
+            'n_average': getattr(gaussian_model, 'n_average', 20),
         }
         ref_state = {'s': state}
         ref_seed_global = {'g': seed_idx_global}
+        ref_model = {'m': gaussian_model}
 
         def _state_from_viz_model(viz, model):
             """Build state dict from visualization_data and gaussian_model (for update_content)."""
@@ -5220,6 +5511,9 @@ class GMCSorter:
                 '_data_range': getattr(model, 'data_range', None),
                 '_sort_range': getattr(model, 'sort_range', None),
                 '_sort_feature_idx': getattr(model, 'sort_feature_idx', None),
+                'drift_correction': getattr(model, 'drift_correction', False),
+                'features_to_drift_correct': getattr(model, 'features_to_drift_correct', None),
+                'n_average': getattr(model, 'n_average', 20),
             }
 
         result = {'accepted': False, 'accept_data': None}
@@ -5241,8 +5535,15 @@ class GMCSorter:
         def re_stabilize():
             """Run iterate_GM_model with current displayed model (and BIC) and user-entered size; if stable, update displayed model."""
             seed_global = ref_seed_global['g']
-            if properties_for_refit is None or cluster_densities_for_refit is None or seed_global is None:
-                messagebox.showwarning("Re-stabilize", "Re-stabilize is not available (e.g. when editing an existing unit).")
+            # Use current all_properties so properties_for_refit and full properties always have the same row order
+            properties_for_refit = self.all_properties[:, included_feat_idxs]
+            cluster_densities_for_refit = self.cluster_den if self.cluster_den is not None else np.ones(properties_for_refit.shape[0], dtype=float)
+            curr_max_prob = self.curr_max_prob
+            t_arr = self.all_properties[:, self.prop_titles.index('t')].copy() if 't' in self.prop_titles else None
+            if t_arr is not None and len(t_arr) != properties_for_refit.shape[0]:
+                t_arr = None
+            if seed_global is None or seed_global >= properties_for_refit.shape[0]:
+                messagebox.showwarning("Re-stabilize", "Seed index no longer valid (data may have changed).")
                 return
             st = ref_state['s']
             viz = ref_viz['v']
@@ -5266,9 +5567,17 @@ class GMCSorter:
                     data_range=st.get('_data_range'),
                     sort_range=st.get('_sort_range'),
                     sort_feature_idx=sort_idx,
+                    drift_correction=st.get('drift_correction', False),
+                    features_to_drift_correct=st.get('features_to_drift_correct'),
+                    n_average=st.get('n_average', 20),
                 )
                 if model_copy.data_range is None:
                     model_copy.compute_data_range(properties_for_refit)
+                prev_model = ref_model['m']
+                if (getattr(prev_model, 't_samples', None) is not None and getattr(prev_model, 'feature_means', None) is not None and getattr(prev_model, 'drift_corrected_feats', None) is not None):
+                    model_copy.t_samples = getattr(prev_model, 't_samples')
+                    model_copy.feature_means = getattr(prev_model, 'feature_means')
+                    model_copy.drift_corrected_feats = getattr(prev_model, 'drift_corrected_feats')
                 gm = self.settings.get('gm') or {}
                 init_stds = gm.get('initial_stds')
                 if init_stds is None or len(np.atleast_1d(init_stds)) != st['covariance'].shape[0]:
@@ -5282,7 +5591,7 @@ class GMCSorter:
                     outcome, model_out, assignment_out, explode_reason = iterate_GM_model(
                         properties_for_refit, cluster_densities_for_refit, model_copy, sort_feature_idx, max_range_sorted,
                         seed_global, min_change=min_change, min_points_for_cluster=min_points_for_cluster,
-                        curr_max_prob=curr_max_prob
+                        curr_max_prob=curr_max_prob, t=t_arr
                     )
                 except Exception as e:
                     messagebox.showerror("Re-stabilize", str(e))
@@ -5311,6 +5620,12 @@ class GMCSorter:
                     viz['all_valid_indices'] = valid_indices_all_new
                     if hasattr(self, 'all_properties') and self.all_properties is not None:
                         viz['all_points_full'] = self.all_properties[valid_indices_all_new].copy()
+                    # Recompute seed indices for new arrays (seed_global unchanged)
+                    viz['seed_point'] = properties_for_refit[seed_global].copy() if seed_global < len(properties_for_refit) else viz.get('seed_point')
+                    seed_row_all = np.where(valid_indices_all_new == seed_global)[0]
+                    viz['seed_row_in_points'] = int(seed_row_all[0]) if len(seed_row_all) > 0 else None
+                    seed_row_core = np.where(valid_indices_new == seed_global)[0]
+                    viz['seed_row_in_core'] = int(seed_row_core[0]) if len(seed_row_core) > 0 else None
                     st['center'] = np.array(model_out.mean, dtype=float).copy()
                     st['covariance'] = np.array(model_out.covariance, dtype=float).copy()
                     st['mah_th'] = float(model_out.mah_threshold)
@@ -5321,11 +5636,20 @@ class GMCSorter:
                     st['_data_range'] = model_out.data_range
                     st['_sort_range'] = getattr(model_out, 'sort_range', None)
                     st['_sort_feature_idx'] = getattr(model_out, 'sort_feature_idx', None)
+                    st['drift_correction'] = getattr(model_out, 'drift_correction', False)
+                    st['features_to_drift_correct'] = getattr(model_out, 'features_to_drift_correct', None)
+                    st['n_average'] = getattr(model_out, 'n_average', 20)
+                    prev_model = ref_model['m']
+                    if (getattr(prev_model, 't_samples', None) is not None and getattr(prev_model, 'feature_means', None) is not None and getattr(prev_model, 'drift_corrected_feats', None) is not None):
+                        model_out.t_samples = getattr(prev_model, 't_samples')
+                        model_out.feature_means = getattr(prev_model, 'feature_means')
+                        model_out.drift_corrected_feats = getattr(prev_model, 'drift_corrected_feats')
+                    ref_model['m'] = model_out
                     mah_th_var.set(round(float(st['mah_th']), 2))
                     redraw()
                 else:
                     msg = f"Outcome was '{outcome}'."
-                    if outcome == 'exploded' and explode_reason:
+                    if explode_reason:
                         msg += " " + explode_reason
                     msg += " Model unchanged."
                     messagebox.showwarning("Re-stabilize", msg)
@@ -5339,8 +5663,15 @@ class GMCSorter:
         def re_fit_model():
             """Run _create_init_cluster_from_seed with new BIC threshold; if success, replace displayed model."""
             seed_global = ref_seed_global['g']
-            if properties_for_refit is None or cluster_densities_for_refit is None or seed_global is None:
-                messagebox.showwarning("Re-fit model", "Re-fit is not available (e.g. when editing an existing unit).")
+            # Use current all_properties so properties_for_refit and full properties always have the same row order
+            properties_for_refit = self.all_properties[:, included_feat_idxs]
+            cluster_densities_for_refit = self.cluster_den if self.cluster_den is not None else np.ones(properties_for_refit.shape[0], dtype=float)
+            curr_max_prob = self.curr_max_prob
+            t_arr = self.all_properties[:, self.prop_titles.index('t')].copy() if 't' in self.prop_titles else None
+            if t_arr is not None and len(t_arr) != properties_for_refit.shape[0]:
+                t_arr = None
+            if seed_global is None or seed_global >= properties_for_refit.shape[0]:
+                messagebox.showwarning("Re-fit model", "Seed index no longer valid (data may have changed).")
                 return
             st = ref_state['s']
             viz = ref_viz['v']
@@ -5372,13 +5703,18 @@ class GMCSorter:
                     'max_range_sorted': float(gm.get('max_range_sorted', gm.get(f'max_range_{self.prop_titles[self.sort_feature_idx] if getattr(self, "sort_feature_idx", None) is not None and self.sort_feature_idx < len(self.prop_titles) else "sorted feature"}', init_stds[sort_local] * 4.0))),
                     'n_samples_density_curve': int(gm.get('n_samples_density_curve', 101)),
                     'multi_cluster_threshold': new_bic,
+                    'drift_correction': getattr(ref_model['m'], 'drift_correction', False),
+                    'features_to_drift_correct': gm.get('features_to_drift_correct', getattr(ref_model['m'], 'features_to_drift_correct', None)),
+                    'n_average': int(gm.get('n_average', getattr(ref_model['m'], 'n_average', 20))),
                 }
                 for k in ['init_mah_th', 'com_iteration_threshold', 'com_iteration_max_iterations', 'density_threshold_for_init_distance',
                           'gaussian_filter_sigma', 'dist_step', 'min_change']:
                     if k in gm:
                         new_settings[k] = gm[k]
+                if t_arr is not None:
+                    new_settings['t'] = t_arr
                 init_result = _create_init_cluster_from_seed(
-                    properties_for_refit, seed_global, cluster_densities_for_refit, curr_max_prob, new_settings
+                    properties_for_refit, seed_global, cluster_densities_for_refit, curr_max_prob, new_settings, t=t_arr
                 )
                 if not init_result['success']:
                     messagebox.showerror("Re-fit model", init_result.get('message', 'Fit failed'))
@@ -5395,22 +5731,27 @@ class GMCSorter:
                 sort_feature_idx = getattr(model, 'sort_feature_idx', 0)
                 max_range_sorted = float(new_settings.get('max_range_sorted', init_stds[sort_feature_idx] * 4.0))
                 min_points_for_cluster = int(new_settings.get('min_points_for_cluster', 100))
+                stable_assignment = None
                 try:
                     _outcome, _model_out, assignment_out, _ = iterate_GM_model(
                         properties_for_refit, cluster_densities_for_refit, model.copy(), sort_feature_idx, max_range_sorted,
                         seed_global, min_change=new_settings.get('min_change', 0.01),
-                        min_points_for_cluster=min_points_for_cluster, curr_max_prob=curr_max_prob
+                        min_points_for_cluster=min_points_for_cluster, curr_max_prob=curr_max_prob, t=t_arr
                     )
                     if _outcome == 'stable':
                         model = _model_out
+                        stable_assignment = assignment_out
                 except Exception:
                     pass
                 first_idx, last_idx = model.data_range
                 valid_indices_new = np.arange(first_idx, last_idx + 1)
-                # Red dots from model's in_bounds rule so they always match the displayed model
-                in_bounds_global = model.in_bounds_indices(properties_for_refit, curr_max_prob)
-                in_bounds_for_viz = (in_bounds_global - first_idx).astype(int)
-                in_bounds_for_viz = in_bounds_for_viz[(in_bounds_for_viz >= 0) & (in_bounds_for_viz < len(valid_indices_new))]
+                if stable_assignment is not None:
+                    in_bounds_for_viz = np.asarray(stable_assignment, dtype=int)
+                    in_bounds_for_viz = in_bounds_for_viz[(in_bounds_for_viz >= 0) & (in_bounds_for_viz < len(valid_indices_new))]
+                else:
+                    in_bounds_global = model.in_bounds_indices(properties_for_refit, curr_max_prob, t=t_arr)
+                    in_bounds_for_viz = (np.asarray(in_bounds_global, dtype=int) - first_idx)
+                    in_bounds_for_viz = in_bounds_for_viz[(in_bounds_for_viz >= 0) & (in_bounds_for_viz < len(valid_indices_new))]
                 points_new = properties_for_refit[valid_indices_new]
                 inv_cov = np.linalg.pinv(model.covariance)
                 diff_new = points_new - model.mean
@@ -5432,6 +5773,12 @@ class GMCSorter:
                 viz['all_valid_indices'] = valid_indices_all_new
                 if hasattr(self, 'all_properties') and self.all_properties is not None:
                     viz['all_points_full'] = self.all_properties[valid_indices_all_new].copy()
+                # Recompute seed indices for new arrays (seed_global unchanged)
+                viz['seed_point'] = properties_for_refit[seed_global].copy() if seed_global < len(properties_for_refit) else viz.get('seed_point')
+                seed_row_all = np.where(valid_indices_all_new == seed_global)[0]
+                viz['seed_row_in_points'] = int(seed_row_all[0]) if len(seed_row_all) > 0 else None
+                seed_row_core = np.where(valid_indices_new == seed_global)[0]
+                viz['seed_row_in_core'] = int(seed_row_core[0]) if len(seed_row_core) > 0 else None
                 st['center'] = np.array(model.mean, dtype=float).copy()
                 st['covariance'] = np.array(model.covariance, dtype=float).copy()
                 st['mah_th'] = float(model.mah_threshold)
@@ -5443,8 +5790,16 @@ class GMCSorter:
                 st['_data_range'] = model.data_range
                 st['_sort_range'] = getattr(model, 'sort_range', None)
                 st['_sort_feature_idx'] = getattr(model, 'sort_feature_idx', None)
+                st['drift_correction'] = getattr(model, 'drift_correction', False)
+                st['features_to_drift_correct'] = getattr(model, 'features_to_drift_correct', None)
+                st['n_average'] = getattr(model, 'n_average', 20)
                 mah_th_var.set(round(float(st['mah_th']), 2))
                 bic_th_var.set(st['bic_th'])
+                ref_model['m'] = model
+                try:
+                    drift_correction_var.set(st['drift_correction'])
+                except (NameError, tk.TclError):
+                    pass
                 redraw()
             finally:
                 self._enable_user_buttons()
@@ -5452,6 +5807,13 @@ class GMCSorter:
                     self._set_buttons_in_frame_state(popup, tk.NORMAL)
                 except tk.TclError:
                     pass
+
+        def _on_drift_correction_toggle():
+            ref_model['m'].drift_correction = drift_correction_var.get()
+            ref_state['s']['drift_correction'] = drift_correction_var.get()
+            n_avg = int(settings.get('n_average', getattr(ref_model['m'], 'n_average', 20)))
+            ref_model['m'].n_average = n_avg
+            ref_state['s']['n_average'] = n_avg
 
         def redraw():
             viz = ref_viz['v']
@@ -5466,7 +5828,8 @@ class GMCSorter:
             covariance = st['covariance']
             mahal_d = st['mahal_d']
             # Use full-window points (assigned + unassigned) when available so sorted spikes show in unit colors
-            if all_points is not None and all_valid_indices is not None and all_points.shape[0] == len(all_valid_indices):
+            using_all_points = (all_points is not None and all_valid_indices is not None and all_points.shape[0] == len(all_valid_indices))
+            if using_all_points:
                 plot_points = all_points
                 plot_valid_indices = all_valid_indices
                 try: 
@@ -5573,28 +5936,84 @@ class GMCSorter:
                     ymin = center_2d[1] - axis_half_y
                     ymax = center_2d[1] + axis_half_y
                 else:
-                    # data_2d (all_points_full) has same row order as plot_points; use plot indices for in-bounds
-                    in_b = np.where(in_bounds_mask)[0]
-                    if len(in_b) > 0:
-                        inc_x = data_2d[in_b, col0]
-                        inc_y = data_2d[in_b, col1]
-                        cx = float(np.mean(inc_x))
-                        cy = float(np.mean(inc_y))
-                        span_x = float(np.ptp(inc_x))
-                        span_y = float(np.ptp(inc_y))
-                        if span_x <= 0:
-                            span_x = max(abs(cx) * 0.1, 1e-6)
-                        if span_y <= 0:
-                            span_y = max(abs(cy) * 0.1, 1e-6)
-                        half_x = span_x * 0.75
-                        half_y = span_y * 0.75
-                        xmin = cx - half_x
-                        xmax = cx + half_x
-                        ymin = cy - half_y
-                        ymax = cy + half_y
+                    # data_2d (all_points_full) has same row order as plot_points
+                    # For t vs drift-corrected feature: use model data_range and model mean±mah_th*std so axis matches assigned/model range
+                    data_range = st.get('_data_range') or getattr(ref_model['m'], 'data_range', None)
+                    t_global = self.prop_titles.index('t') if (hasattr(self, 'prop_titles') and 't' in self.prop_titles) else None
+                    mod = ref_model['m']
+                    drift_feats = getattr(mod, 'drift_corrected_feats', None)
+                    drift_globals = [included_feat_idxs[k] for k in drift_feats if k < len(included_feat_idxs)] if drift_feats is not None else []
+                    is_t_vs_drift = (t_global is not None and drift_globals and
+                        ((prop_idx_0 == t_global and prop_idx_1 in drift_globals) or (prop_idx_1 == t_global and prop_idx_0 in drift_globals)))
+                    if is_t_vs_drift and data_range is not None and len(data_range) >= 2:
+                        first_idx, last_idx = int(data_range[0]), int(data_range[1])
+                        pvi = np.asarray(plot_valid_indices, dtype=np.int64)
+                        model_window_mask = (pvi >= first_idx) & (pvi <= last_idx)
+                        if np.any(model_window_mask):
+                            if prop_idx_0 == t_global:
+                                t_col, feat_col = col0, col1
+                                local_feat = included_feat_idxs.index(prop_idx_1)
+                            else:
+                                t_col, feat_col = col1, col0
+                                local_feat = included_feat_idxs.index(prop_idx_0)
+                            t_vals = data_2d[model_window_mask, t_col]
+                            t_lo, t_hi = float(np.min(t_vals)), float(np.max(t_vals))
+                            std_f = np.sqrt(max(float(covariance[local_feat, local_feat]), 1e-12))
+                            half_f = 1.5 * mah_th * std_f
+                            feat_center = float(center[local_feat])
+                            feat_lo, feat_hi = feat_center - half_f, feat_center + half_f
+                            pad_t = (t_hi - t_lo) * 0.05 if t_hi > t_lo else 1.0
+                            pad_f = (feat_hi - feat_lo) * 0.05 if feat_hi > feat_lo else 1.0
+                            if prop_idx_0 == t_global:
+                                xmin, xmax = t_lo - pad_t, t_hi + pad_t
+                                ymin, ymax = feat_lo - pad_f, feat_hi + pad_f
+                            else:
+                                xmin, xmax = feat_lo - pad_f, feat_hi + pad_f
+                                ymin, ymax = t_lo - pad_t, t_hi + pad_t
+                        else:
+                            in_b = np.where(in_bounds_mask)[0]
+                            if len(in_b) > 0:
+                                inc_x = data_2d[in_b, col0]
+                                inc_y = data_2d[in_b, col1]
+                                cx = float(np.mean(inc_x))
+                                cy = float(np.mean(inc_y))
+                                span_x = float(np.ptp(inc_x))
+                                span_y = float(np.ptp(inc_y))
+                                if span_x <= 0:
+                                    span_x = max(abs(cx) * 0.1, 1e-6)
+                                if span_y <= 0:
+                                    span_y = max(abs(cy) * 0.1, 1e-6)
+                                half_x = span_x * 0.75
+                                half_y = span_y * 0.75
+                                xmin = cx - half_x
+                                xmax = cx + half_x
+                                ymin = cy - half_y
+                                ymax = cy + half_y
+                            else:
+                                xmin, xmax = data_min_x, data_max_x
+                                ymin, ymax = data_min_y, data_max_y
                     else:
-                        xmin, xmax = data_min_x, data_max_x
-                        ymin, ymax = data_min_y, data_max_y
+                        in_b = np.where(in_bounds_mask)[0]
+                        if len(in_b) > 0:
+                            inc_x = data_2d[in_b, col0]
+                            inc_y = data_2d[in_b, col1]
+                            cx = float(np.mean(inc_x))
+                            cy = float(np.mean(inc_y))
+                            span_x = float(np.ptp(inc_x))
+                            span_y = float(np.ptp(inc_y))
+                            if span_x <= 0:
+                                span_x = max(abs(cx) * 0.1, 1e-6)
+                            if span_y <= 0:
+                                span_y = max(abs(cy) * 0.1, 1e-6)
+                            half_x = span_x * 0.75
+                            half_y = span_y * 0.75
+                            xmin = cx - half_x
+                            xmax = cx + half_x
+                            ymin = cy - half_y
+                            ymax = cy + half_y
+                        else:
+                            xmin, xmax = data_min_x, data_max_x
+                            ymin, ymax = data_min_y, data_max_y
                 xmin = max(xmin, data_min_x)
                 xmax = min(xmax, data_max_x)
                 ymin = max(ymin, data_min_y)
@@ -5664,7 +6083,7 @@ class GMCSorter:
                 if len(in_bounds_in_range) > 0:
                     x_in = data_2d[in_bounds_in_range, col0]
                     y_in = data_2d[in_bounds_in_range, col1]
-                    ax.scatter(x_in, y_in, c='red', s=dot_sz, alpha=0.8, zorder=2)
+                    ax.scatter(x_in, y_in, c='red', s=dot_sz, alpha=0.8, zorder=5)
                 for ul in self.unit_labels:
                     ass = (point_unit_ids == ul) & in_range_mask & ~in_bounds_mask
                     if ss > 1 and n_pts > 0:
@@ -5682,9 +6101,39 @@ class GMCSorter:
                         [covariance[local_i1, local_i0], covariance[local_i1, local_i1]]
                     ])
                     ax.scatter(center_2d[0], center_2d[1], s=100, c='red', edgecolors='black', linewidths=2, zorder=5)
-                    if seed_point is not None and local_i0 < len(seed_point) and local_i1 < len(seed_point):
+                    # Draw seed (orange dot) from same row as scatter data when available, so indexing matches
+                    seed_row_plot = viz.get('seed_row_in_points') if using_all_points else viz.get('seed_row_in_core')
+                    if seed_row_plot is not None and 0 <= seed_row_plot < n_pts:
+                        ax.scatter(data_2d[seed_row_plot, col0], data_2d[seed_row_plot, col1], s=200, c='orange', edgecolors='black', linewidths=2, zorder=6)
+                    elif seed_point is not None and local_i0 < len(seed_point) and local_i1 < len(seed_point):
                         ax.scatter(seed_point[local_i0], seed_point[local_i1], s=200, c='orange', edgecolors='black', linewidths=2, zorder=6)
                     self._plot_mahalanobis_ellipse(ax, center_2d, cov_2d, mah_th, linestyle='--', color='red', linewidth=1.5)
+                else:
+                    # One axis is 't' (not in included), other is drift-corrected: draw drift range lines only
+                    if hasattr(self, 'prop_titles') and 't' in self.prop_titles:
+                        t_global = self.prop_titles.index('t')
+                        mod = ref_model['m']
+                        t_samp = getattr(mod, 't_samples', None)
+                        f_means = getattr(mod, 'feature_means', None)
+                        drift_feats = getattr(mod, 'drift_corrected_feats', None)
+                        if t_samp is not None and f_means is not None and drift_feats is not None and len(t_samp) > 0:
+                            drift_globals = [included_feat_idxs[k] for k in drift_feats if k < len(included_feat_idxs)]
+                            if prop_idx_0 == t_global and prop_idx_1 in drift_globals:
+                                local_feat = included_feat_idxs.index(prop_idx_1)
+                                j = drift_feats.index(local_feat)
+                                f_vals = np.asarray(f_means[:, j], dtype=float)
+                                std = np.sqrt(max(float(covariance[local_feat, local_feat]), 1e-12))
+                                half = std * mah_th
+                                ax.plot(t_samp, f_vals - half, linestyle='--', color='red', linewidth=1.5, zorder=4)
+                                ax.plot(t_samp, f_vals + half, linestyle='--', color='red', linewidth=1.5, zorder=4)
+                            elif prop_idx_1 == t_global and prop_idx_0 in drift_globals:
+                                local_feat = included_feat_idxs.index(prop_idx_0)
+                                j = drift_feats.index(local_feat)
+                                f_vals = np.asarray(f_means[:, j], dtype=float)
+                                std = np.sqrt(max(float(covariance[local_feat, local_feat]), 1e-12))
+                                half = std * mah_th
+                                ax.plot(f_vals - half, t_samp, linestyle='--', color='red', linewidth=1.5, zorder=4)
+                                ax.plot(f_vals + half, t_samp, linestyle='--', color='red', linewidth=1.5, zorder=4)
                 ax.set_xlim(xmin, xmax)
                 ax.set_ylim(ymin, ymax)
                 feat_name_0 = self.prop_titles[prop_idx_0] if prop_idx_0 < len(self.prop_titles) else f"F{prop_idx_0}"
@@ -5722,6 +6171,9 @@ class GMCSorter:
         bic_entry = ttk.Entry(ctrl, textvariable=bic_th_var, width=10)
         bic_entry.pack(side=tk.LEFT, padx=2)
         ttk.Button(ctrl, text="Re-fit model", command=re_fit_model).pack(side=tk.LEFT, padx=2)
+        drift_correction_var = tk.BooleanVar(value=getattr(ref_model['m'], 'drift_correction', False))
+        drift_cb = ttk.Checkbutton(ctrl, text="Drift correction", variable=drift_correction_var, command=_on_drift_correction_toggle)
+        drift_cb.pack(side=tk.LEFT, padx=2)
         def on_accept():
             st = ref_state['s']
             viz = ref_viz['v']
@@ -5735,12 +6187,21 @@ class GMCSorter:
             dc = st.get('density_curve')
             mahal_in_b = st['mahal_d'][in_b]
             prob_density_in_b = prob_density_from_curve_or_formula(mahal_in_b, mah_th, density_curve=dc)
-            result['accept_data'] = {
-                'spike_ids': vind[in_b],
-                'model': GaussianModel(mean=st['center'], covariance=st['covariance'],
+            acc_model = GaussianModel(mean=st['center'], covariance=st['covariance'],
                                       bic_threshold=st['bic_th'], mah_threshold=st['mah_th'],
                                       data_range=data_range, sort_range=sort_range, sort_feature_idx=sort_feat_local,
-                                      density_curve=dc),
+                                      density_curve=dc,
+                                      drift_correction=st.get('drift_correction', False),
+                                      features_to_drift_correct=st.get('features_to_drift_correct'),
+                                      n_average=st.get('n_average', 20))
+            mod = ref_model['m']
+            if getattr(mod, 't_samples', None) is not None and getattr(mod, 'feature_means', None) is not None and getattr(mod, 'drift_corrected_feats', None) is not None:
+                acc_model.t_samples = getattr(mod, 't_samples')
+                acc_model.feature_means = getattr(mod, 'feature_means')
+                acc_model.drift_corrected_feats = getattr(mod, 'drift_corrected_feats')
+            result['accept_data'] = {
+                'spike_ids': vind[in_b],
+                'model': acc_model,
                 'feature_indices': list(included_feat_idxs),
                 'sort_feature_idx_global': settings.get('sort_feature_idx_global') if settings else None,
             }
@@ -5776,10 +6237,15 @@ class GMCSorter:
 
         def update_content(new_viz, new_model, new_seed_idx, new_n_seeds, new_seed_idx_global):
             ref_viz['v'] = new_viz
+            ref_model['m'] = new_model
             ref_state['s'] = _state_from_viz_model(new_viz, new_model)
             ref_seed_global['g'] = new_seed_idx_global
             mah_th_var.set(round(float(ref_state['s']['mah_th']), 2))
             bic_th_var.set(ref_state['s']['bic_th'])
+            try:
+                drift_correction_var.set(ref_state['s'].get('drift_correction', False))
+            except (NameError, tk.TclError):
+                pass
             popup.title(f"Seed {new_seed_idx + 1}/{new_n_seeds} - Accept/Reject Gaussian model")
             redraw()
             canvas_widget.draw()
@@ -6162,7 +6628,10 @@ class GMCSorter:
         seed_point = visualization_data.get('seed_point')
         test_props = settings.get('_test_properties')
         if test_props is not None and settings.get('curr_max_prob') is not None:
-            in_bounds_global = gaussian_model.in_bounds_indices(test_props, np.asarray(settings['curr_max_prob'], dtype=float))
+            t_test = None
+            if hasattr(self, 'prop_titles') and self.prop_titles and 't' in self.prop_titles and hasattr(self, 'all_properties') and self.all_properties is not None and self.all_properties.shape[0] == test_props.shape[0]:
+                t_test = np.asarray(self.all_properties[:, self.prop_titles.index('t')], dtype=float).ravel()
+            in_bounds_global = gaussian_model.in_bounds_indices(test_props, np.asarray(settings['curr_max_prob'], dtype=float), t=t_test)
             in_bounds = np.where(np.isin(valid_indices, in_bounds_global))[0]
         else:
             in_bounds_raw = np.asarray(visualization_data['in_bounds'], dtype=float)

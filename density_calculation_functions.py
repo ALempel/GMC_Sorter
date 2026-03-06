@@ -481,7 +481,8 @@ def _interpolate_grid_to_spikes(properties, density_grid, bin_edges, grid_shape)
     Interpolate density grid values to spike positions using linear interpolation.
     
     Uses scipy.interpolate.RegularGridInterpolator for multi-dimensional linear interpolation.
-    Spikes outside the grid boundaries get density = 0 (will be handled by caller).
+    Coordinates outside the grid in any feature are capped to the grid boundary, so densities
+    are constant beyond the grid (boundary value is used).
     
     Parameters:
     -----------
@@ -503,21 +504,28 @@ def _interpolate_grid_to_spikes(properties, density_grid, bin_edges, grid_shape)
     assert len(bin_edges) == D
     assert len(grid_shape) == D
     
+    # Cap properties to grid bounds so all coordinates are inside the grid (constant extrapolation)
+    properties_capped = np.empty_like(properties, dtype=np.float64)
+    for d in range(D):
+        min_edge = float(bin_edges[d][0])
+        max_edge = float(bin_edges[d][-1])
+        properties_capped[:, d] = np.clip(properties[:, d], min_edge, max_edge)
+    
     # Compute bin centers for each dimension
     centers = [0.5 * (e[1:] + e[:-1]) for e in bin_edges]
     
-    # Create interpolator
+    # Create interpolator (all query points are in-bounds after capping)
     interpolator = RegularGridInterpolator(
         centers,
         density_grid,
         bounds_error=False,
-        fill_value=None  # allows extrapolation
+        fill_value=None
     )
     
-    # Interpolate for all spike positions
-    spike_densities = interpolator(properties)
+    # Interpolate at capped positions
+    spike_densities = interpolator(properties_capped)
     
-    # Convert to float64 and handle any NaN/None values from extrapolation
+    # Convert to float64 and handle any NaN/inf from numerical issues
     spike_densities = np.asarray(spike_densities, dtype=np.float64)
     spike_densities = np.nan_to_num(spike_densities, nan=0.0, posinf=0.0, neginf=0.0)
     
@@ -830,20 +838,8 @@ def calculate_densities_batch(properties, prop_titles, included_feature_indexes,
             batch_background_density.shape
         )
         
-        # Handle spikes outside grid: background = reg_density, cluster = 0
-        # Check which spikes are outside grid boundaries
-        out_of_bounds = np.zeros(len(batch_properties_interp), dtype=bool)
-        for d in range(len(batch_bin_edges)):
-            dim_values = batch_properties_interp[:, d]
-            min_edge = batch_bin_edges[d][0]
-            max_edge = batch_bin_edges[d][-1]
-            out_of_bounds |= (dim_values < min_edge) | (dim_values > max_edge)
-        
-        # Set default values for out-of-bounds spikes
-        batch_background_den[out_of_bounds] = reg_density
-        batch_cluster_den[out_of_bounds] = 0.0
-        
-        # Cap background_den to be at least reg_density (for in-bounds spikes that might be very low)
+        # Densities were interpolated at capped coords (constant beyond grid); no out-of-bounds zeroing.
+        # Cap background_den to be at least reg_density (for spikes that might get very low interpolated value)
         batch_background_den = np.maximum(batch_background_den, reg_density)
         
         del batch_background_density, batch_cluster_density

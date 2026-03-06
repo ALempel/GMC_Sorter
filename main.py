@@ -1,6 +1,6 @@
 #%%
 Animal_prefix = 'F'
-Animal = '1807'
+Animal = '1261'
 Chunk_list = [] # Empty list to do all chunks
 probe = 'CNtch_H9'
 file_struct = 'dat_t_s'
@@ -83,4 +83,5 @@ if len(Chunk_list) == 0:
 for Chunk in Chunk_list:
     print(f'Processing chunk {Chunk} of {total_chunks}')
     do_chunk()
+
 # %%

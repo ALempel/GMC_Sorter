@@ -16,23 +16,29 @@ except ImportError:
     DEVICE = None
 
 
-def gm_seed_local_max(properties, clust_ind, spikes_per_batch_thousands, minimum_cluster_index,
+def gm_seed_local_max(properties, clust_ind, cluster_den, spikes_per_batch_thousands, minimum_cluster_index,
                        feature_distances, sorted_feature_idx, progress_callback=None, bounds=None):
     """
     Find local maxima seeds for Gaussian Mixture Model sorting.
     Caller (e.g. visualizer) must pass feature_distances and bounds keyed by column index
     into properties, and sorted_feature_idx; no feature names/titles.
     
+    Seeds are filtered by minimum_cluster_index (clust_ind). Among those, local maxima
+    are found in cluster density (cluster_den): a spike is a seed if no other spike
+    within the feature-distance neighborhood has higher cluster density.
+    
     Parameters
     ----------
     properties : np.ndarray, shape (N, n_features)
         Spike properties array
     clust_ind : np.ndarray, shape (N,)
-        Cluster index for each spike (cluster_den / background_den)
+        Cluster index for each spike (cluster_den / background_den); used to filter candidates.
+    cluster_den : np.ndarray, shape (N,)
+        Cluster density for each spike; used to find local maxima (seeds are local maxima of cluster_den).
     spikes_per_batch_thousands : float
         Number of spikes per batch (in thousands)
     minimum_cluster_index : float
-        Minimum cluster index threshold
+        Minimum cluster index threshold (filter: only spikes with clust_ind >= this are considered).
     feature_distances : dict
         Dictionary mapping column index (int) to distance value
     sorted_feature_idx : int
@@ -78,7 +84,7 @@ def gm_seed_local_max(properties, clust_ind, spikes_per_batch_thousands, minimum
     # This also ensures data is contiguous which accelerates operations
     n_valid = len(valid_indices)
     properties_filtered = properties[valid_indices, :].astype(np.float32)
-    clust_ind_filtered = clust_ind[valid_indices].astype(np.float32)
+    cluster_den_filtered = np.asarray(cluster_den[valid_indices], dtype=np.float64)
     
     # Store mapping from filtered indices back to global indices
     # valid_indices[i] gives the global index of the i-th filtered spike
@@ -223,7 +229,7 @@ def gm_seed_local_max(properties, clust_ind, spikes_per_batch_thousands, minimum
         # Get spikes in padded batch (from filtered data, already float32)
         # Views are fine - they don't copy data, just reference it
         batch_properties = properties_filtered[padded_start:padded_end, :]
-        batch_clust_ind = clust_ind_filtered[padded_start:padded_end]
+        batch_cluster_den = cluster_den_filtered[padded_start:padded_end]
         spikes_in_batch = batch_properties.shape[0]
         
         if spikes_in_batch == 0:
@@ -235,7 +241,7 @@ def gm_seed_local_max(properties, clust_ind, spikes_per_batch_thousands, minimum
         
         # Initialize comparisons matrix: (spikes_in_batch, spikes_in_batch)
         # comparisons[i, j] will be True if spike j is within all feature distances of spike i
-        # AND spike j has clust_ind >= spike i's clust_ind
+        # AND spike j has cluster_den >= spike i's cluster_den (local max in cluster density)
         # A spike is a local max if there are NO other spikes satisfying these conditions
         if TORCH_AVAILABLE and DEVICE.type == 'cuda':
             comparisons = torch.ones((spikes_in_batch, spikes_in_batch), dtype=torch.bool, device=DEVICE)
@@ -294,33 +300,31 @@ def gm_seed_local_max(properties, clust_ind, spikes_per_batch_thousands, minimum
                 # Update comparisons: AND with feature_comparisons
                 comparisons = comparisons & feature_comparisons
         
-        # 3- Compute cluster index comparison: clust_ind[s2] >= clust_ind[s1]
+        # 3- Compute cluster density comparison: cluster_den[s2] >= cluster_den[s1]
         # Shape: (spikes_in_batch, spikes_in_batch)
-        # clust_ind_matrix[i, j] is True if clust_ind[j] >= clust_ind[i]
+        # density_matrix[i, j] is True if cluster_den[j] >= cluster_den[i] (local max in cluster density)
         # Use GPU if available for faster computation
         if TORCH_AVAILABLE and DEVICE.type == 'cuda':
             # Transfer to GPU and compute on GPU
-            batch_clust_ind_gpu = torch.from_numpy(batch_clust_ind).to(DEVICE)
-            # clust_ind_matrix[i, j] = True if clust_ind[j] >= clust_ind[i]
-            # This is: row vector >= column vector = (1, N) >= (N, 1)
-            clust_ind_matrix_gpu = batch_clust_ind_gpu[None, :] >= batch_clust_ind_gpu[:, None]
-            # Update comparisons: AND with clust_ind_matrix
-            comparisons = comparisons & clust_ind_matrix_gpu
+            batch_cluster_den_gpu = torch.from_numpy(batch_cluster_den).to(DEVICE)
+            # density_matrix[i, j] = True if cluster_den[j] >= cluster_den[i]
+            density_matrix_gpu = batch_cluster_den_gpu[None, :] >= batch_cluster_den_gpu[:, None]
+            # Update comparisons: AND with density_matrix
+            comparisons = comparisons & density_matrix_gpu
             # Free GPU memory
-            del batch_clust_ind_gpu, clust_ind_matrix_gpu, batch_clust_ind
+            del batch_cluster_den_gpu, density_matrix_gpu
             torch.cuda.empty_cache()  # Clear GPU cache
         else:
             # CPU fallback
-            # clust_ind_matrix[i, j] = True if clust_ind[j] >= clust_ind[i]
-            # This is: row vector >= column vector = (1, N) >= (N, 1)
-            clust_ind_matrix = batch_clust_ind[np.newaxis, :] >= batch_clust_ind[:, np.newaxis]
-            # Update comparisons: AND with clust_ind_matrix
-            comparisons = comparisons & clust_ind_matrix
+            # density_matrix[i, j] = True if cluster_den[j] >= cluster_den[i]
+            density_matrix = batch_cluster_den[np.newaxis, :] >= batch_cluster_den[:, np.newaxis]
+            # Update comparisons: AND with density_matrix
+            comparisons = comparisons & density_matrix
             # Free memory
-            del clust_ind_matrix, batch_clust_ind
+            del density_matrix
         
         # 4- A spike is a local max if there are NO OTHER spikes (excluding itself) within all 
-        # feature distances that have clust_ind >= the current spike's clust_ind
+        # feature distances that have cluster_den >= the current spike's cluster_den
         # We need to exclude the diagonal (i == j) because a spike is always within distance of itself
         if TORCH_AVAILABLE and DEVICE.type == 'cuda':
             # Convert to numpy for final computation
@@ -428,44 +432,8 @@ def whiten_data(data, cov, center=None):
     return whitened_data
 
 
-def apply_bic_refinement(points, center, cov, in_bounds, bic_threshold, n_features, min_points_for_cluster=100, max_iter=3, seed_row=None):
-    """
-    Optionally refine in_bounds by GMM 1 vs 2 BIC; return refined in_bounds (indices into points).
-    Data is whitened with the current covariance (and center) so the BIC comparison is in spherical space.
-    If seed_row is not None, keep the cluster containing the seed; else keep the cluster containing the model center.
-    """
-    if len(in_bounds) < min_points_for_cluster:
-        return in_bounds
-    iteration_count = 0
-    while iteration_count < max_iter:
-        data = whiten_data(points[in_bounds, :], cov, center=center)
-        gmm_1 = GaussianMixture(n_components=1, random_state=42, max_iter=100)
-        gmm_2 = GaussianMixture(n_components=2, random_state=42, max_iter=100)
-        gmm_1.fit(data)
-        gmm_2.fit(data)
-        bic_1 = gmm_1.bic(data)
-        bic_2 = gmm_2.bic(data)
-        dBIC = (bic_1 - bic_2) / len(data)
-        if dBIC <= bic_threshold:
-            break
-        labels = gmm_2.predict(data)
-        if seed_row is not None:
-            seed_in_data = np.where(in_bounds == seed_row)[0]
-            if len(seed_in_data) > 0:
-                keep_label = gmm_2.predict(data[seed_in_data[0]:seed_in_data[0] + 1])[0]
-                in_bounds = in_bounds[labels == keep_label]
-            else:
-                center_label = gmm_2.predict(np.zeros((1, n_features)))
-                in_bounds = in_bounds[labels == center_label[0]]
-        else:
-            center_label = gmm_2.predict(np.zeros((1, n_features)))
-            in_bounds = in_bounds[labels == center_label[0]]
-        iteration_count += 1
-    return in_bounds
-
-
 def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sorted,
-                     seed_idx, min_change=0.01, min_points_for_cluster=100, curr_max_prob=None):
+                     seed_idx, min_change=0.01, min_points_for_cluster=100, curr_max_prob=None, t=None):
     """
     Iteratively refine a Gaussian model (COM and covariance). Caller passes a copy of the model
     so the original is only updated depending on outcome. The window (points) and valid_indices
@@ -493,6 +461,8 @@ def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sor
     curr_max_prob : np.ndarray, shape (M,)
         Per-spike current_max_prob (background density or previous prob_density). in_bounds uses
         prob_density > curr_max_prob (prob_density from density_curve or linear decay). Required.
+    t : np.ndarray, shape (M,), optional
+        Time for each row; used for drift correction when model has drift_corrected_feats set.
 
     Returns
     -------
@@ -505,10 +475,18 @@ def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sor
     reason : str or None
         On exploded: reason string ('repeated BIC refinement' or 'max range exceeded (sorted feature)'). Otherwise None.
     """
+    n_rows = properties.shape[0]
     if model.data_range is None:
         raise ValueError("model.data_range must be set (e.g. via model.compute_data_range(properties)) before calling iterate_GM_model")
-    if curr_max_prob is None or len(curr_max_prob) < properties.shape[0]:
+    if curr_max_prob is None or len(curr_max_prob) < n_rows:
         raise ValueError("curr_max_prob is required and must have same length as spikes (number of rows in properties)")
+    weights = np.asarray(weights, dtype=float)
+    if len(weights) != n_rows:
+        raise ValueError("weights must have same length as properties (got %d vs %d)" % (len(weights), n_rows))
+    if t is not None:
+        t = np.asarray(t, dtype=float).ravel()
+        if len(t) != n_rows:
+            raise ValueError("t must have same length as properties when provided (got %d vs %d)" % (len(t), n_rows))
     curr_max_prob = np.asarray(curr_max_prob, dtype=float)
     if np.any(np.isnan(curr_max_prob)) or np.any((curr_max_prob < 0) & np.isfinite(curr_max_prob)):
         raise ValueError("curr_max_prob must contain only valid (non-negative finite) values or inf")
@@ -523,9 +501,21 @@ def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sor
     collapsed = False
     exploded = False
     explode_reason = None
+    collapse_reason = None
     BIC_refined = False
 
-    assignment_global = model.in_bounds_indices(properties, curr_max_prob)
+    assignment_global = model.in_bounds_indices(properties, curr_max_prob, t=t)
+    if getattr(model, 'drift_correction', False) and t is not None:
+        feats = getattr(model, 'features_to_drift_correct', None)
+        if feats is not None and len(feats) > 0:
+            t_samp = getattr(model, 't_samples', None)
+            f_means = getattr(model, 'feature_means', None)
+            has_drift_state = (t_samp is not None and f_means is not None
+                               and len(t_samp) > 0 and len(f_means) > 0)
+            if not has_drift_state:
+                n_avg = getattr(model, 'n_average', 20)
+                model.drift_correct(properties, curr_max_prob, feats, t=t, n_average=n_avg)
+                assignment_global = model.in_bounds_indices(properties, curr_max_prob, t=t)
     assignment = assignment_global - first_idx
     n_initial_assignment = len(assignment)
     max_inner_iter = 200
@@ -541,19 +531,32 @@ def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sor
 
         if len(assignment) == 0:
             collapsed = True
+            collapse_reason = "empty in-bounds set (0 points) at iteration %d" % inner_iter
             break
         # Refresh mean, covariance, and core/fringe densities from in-bounds data
-        model.refresh_covs_and_densities(points[assignment], weights_window[assignment])
+        t_in_bounds = None
+        if t is not None and getattr(model, 'drift_corrected_feats', None) is not None and getattr(model, 't_samples', None) is not None:
+            if len(assignment_global) > 0:
+                if np.min(assignment_global) < 0 or np.max(assignment_global) >= len(t):
+                    collapsed = True
+                    collapse_reason = ("t and properties row order mismatch: in-bounds indices out of range for t "
+                                      "(min=%d max=%d, t length=%d) at iteration %d" % (
+                                          int(np.min(assignment_global)), int(np.max(assignment_global)), len(t), inner_iter))
+                    break
+            t_in_bounds = t[assignment_global]
+        model.refresh_covs_and_mean(points[assignment], weights_window[assignment], t=t_in_bounds)
         new_center = model.mean
         new_cov = model.covariance
         if np.any(np.isnan(new_center)):
             collapsed = True
+            collapse_reason = "NaN in refreshed mean"
             break
         # Model range check: only sorted feature dimension; range = 2*bounds*std
         stds = np.sqrt(np.maximum(np.diag(new_cov), 0.0))
         range_sorted = 2.0 * bounds * stds[sort_feature_idx]
         if range_sorted < 1e-9:
             collapsed = True
+            collapse_reason = "sorted-feature std too small (range_sorted < 1e-9)"
             break
         if range_sorted > max_range_sorted:
             exploded = True
@@ -566,18 +569,16 @@ def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sor
         weights_window = weights[first_idx:last_idx + 1]
         seed_row = (seed_idx - first_idx) if first_idx <= seed_idx <= last_idx else None
 
-        # Recompute in-bounds (assignment) on new points, including BIC refinement
-        assignment_global = model.in_bounds_indices(properties, curr_max_prob)
+        # Recompute in-bounds (assignment) on new points; use current drift only so mean and drift stay consistent this iteration
+        assignment_global = model.in_bounds_indices(properties, curr_max_prob, t=t)
         assignment = assignment_global - first_idx
 
-        n_before_bic = len(assignment)
-        assignment = apply_bic_refinement(
-            points, new_center, new_cov, assignment,
-            bic_threshold, n_features,
-            min_points_for_cluster=min_points_for_cluster,
-            max_iter=3, seed_row=seed_row
+        # BIC refinement on drift-corrected assigned data (method returns global indices)
+        bic_did_refine, assignment_global = model.bic_refinement(
+            properties, assignment_global, seed_idx=seed_idx, t=t,
+            min_points_for_cluster=min_points_for_cluster, max_iter=3
         )
-        bic_did_refine = len(assignment) < n_before_bic
+        assignment = assignment_global - first_idx
 
         if bic_did_refine:
             if BIC_refined:
@@ -592,8 +593,16 @@ def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sor
 
         if n_after < n_initial_assignment*0.5:
             collapsed = True
+            collapse_reason = ("assignment shrank to %d < 50%% of initial (%d) at iteration %d" % (
+                n_after, n_initial_assignment, inner_iter))
             break
         if n_after > n_prev + min_change * n_prev:
+            # Update drift for next iteration so mean and drift stay consistent within each iteration
+            if getattr(model, 'drift_correction', False) and t is not None:
+                feats = getattr(model, 'features_to_drift_correct', None)
+                if feats is not None and len(feats) > 0:
+                    n_avg = getattr(model, 'n_average', 20)
+                    model.drift_correct(properties, curr_max_prob, feats, t=t, n_average=n_avg)
             continue
         break
 
@@ -605,7 +614,7 @@ def iterate_GM_model(properties, weights, model, sort_feature_idx, max_range_sor
     else:
         outcome = 'stable'
 
-    reason = explode_reason if exploded else None
+    reason = collapse_reason if collapsed else (explode_reason if exploded else None)
     return outcome, model, assignment, reason
 
 
@@ -651,7 +660,8 @@ class GaussianModel:
         If set, shape (101,) density at relative Mahal 0, 0.01, ..., 1.0; prob_density is computed by linear interpolation from this.
     """
     def __init__(self, mean, covariance, bic_threshold, mah_threshold,
-                 data_range=None, sort_range=None, sort_feature_idx=None, density_curve=None):
+                 data_range=None, sort_range=None, sort_feature_idx=None, density_curve=None,
+                 drift_correction=False, features_to_drift_correct=None, n_average=20):
         self.mean = mean
         self.covariance = covariance
         self.bic_threshold = bic_threshold
@@ -660,17 +670,47 @@ class GaussianModel:
         self.sort_range = sort_range
         self.sort_feature_idx = sort_feature_idx
         self.density_curve = density_curve
+        self.drift_correction = bool(drift_correction)
+        self.features_to_drift_correct = list(features_to_drift_correct) if features_to_drift_correct is not None else None
+        self.n_average = int(n_average) if n_average is not None else 20
 
-    def refresh_covs_and_densities(self, points, cluster_densities):
+    def _apply_drift_correction(self, data, t):
+        """If drift_corrected_feats, t_samples, feature_means are set and t is not None, return data with
+        drift subtracted (linear interpolation from t_samples, feature_means). Otherwise return copy of data."""
+        data = np.asarray(data, dtype=float)
+        feats = getattr(self, 'drift_corrected_feats', None)
+        t_samp = getattr(self, 't_samples', None)
+        f_means = getattr(self, 'feature_means', None)
+        if feats is None or t_samp is None or f_means is None or len(t_samp) == 0 or t is None:
+            return np.copy(data)
+        t = np.asarray(t, dtype=float).ravel()
+        if t.shape[0] != data.shape[0]:
+            return np.copy(data)
+        t_samp_min, t_samp_max = float(np.min(t_samp)), float(np.max(t_samp))
+        t_clipped = np.clip(t, t_samp_min, t_samp_max)
+        out = np.copy(data)
+        n_drift = f_means.shape[1]
+        for j in range(n_drift):
+            drift_j = np.interp(t_clipped, t_samp, f_means[:, j])
+            out[:, feats[j]] = data[:, feats[j]] - drift_j
+        return out
+
+    def refresh_covs_and_mean(self, points, cluster_densities, t=None):
         """
         Update mean and covariance from in-bound points and their cluster densities.
-        Center = cluster-density-weighted COM; covariance = unweighted sample covariance (regularized);
+        Center = cluster-density-weighted COM; covariance = unweighted sample covariance (regularized).
+        If drift_corrected_feats/t_samples/feature_means are set and t is provided, points are
+        drift-corrected before computing mean/cov; then the mean of feature_means over t is added
+        to the computed mean (for drift-corrected indices) before saving to the model.
+
         Parameters
         ----------
         points : np.ndarray, shape (n, n_features)
             In-bound points (same feature space as self.mean).
         cluster_densities : np.ndarray, shape (n,)
             Cluster density for each point.
+        t : np.ndarray, shape (n,), optional
+            Time for each point; required for drift correction when model has drift_corrected_feats set.
 
         Returns
         -------
@@ -682,8 +722,14 @@ class GaussianModel:
         n_features = points.shape[1]
         if n == 0:
             return
+        points = self._apply_drift_correction(points, t)
         if n == 1:
-            self.mean = np.copy(points[0])
+            new_center = np.copy(points[0])
+            feats = getattr(self, 'drift_corrected_feats', None)
+            f_means = getattr(self, 'feature_means', None)
+            if feats is not None and f_means is not None and len(f_means) > 0:
+                new_center[feats] += np.mean(f_means, axis=0)
+            self.mean = new_center
             return
         w = cluster_densities
         Nk = np.sum(w)
@@ -692,7 +738,15 @@ class GaussianModel:
             w = np.ones(n, dtype=float)
         weighted_sum = np.sum(w[:, np.newaxis] * points, axis=0)
         new_center = weighted_sum / Nk
-        diff_c = points - new_center
+        feats = getattr(self, 'drift_corrected_feats', None)
+        f_means = getattr(self, 'feature_means', None)
+        mean_drift = np.mean(f_means, axis=0) if feats is not None and f_means is not None and len(f_means) > 0 else None
+        if mean_drift is not None:
+            new_center[feats] += mean_drift
+        center_drift_space = new_center.copy()
+        if mean_drift is not None:
+            center_drift_space[feats] -= mean_drift
+        diff_c = points - center_drift_space
         new_cov = np.einsum('ni,nj->ij', diff_c, diff_c) / n
         new_cov = 0.5 * (new_cov + new_cov.T)
         reg = max(1e-10, 1e-8 * np.trace(new_cov) / n_features)
@@ -700,9 +754,79 @@ class GaussianModel:
         self.mean = np.copy(new_center)
         self.covariance = np.copy(new_cov)
 
+    def bic_refinement(self, properties, assignment_global, seed_idx=None, t=None, min_points_for_cluster=100, max_iter=3):
+        """
+        Refine in-bounds assignment by GMM 1 vs 2 BIC on drift-corrected data.
+        Takes global properties and current assignment (global indices), drift-corrects the assigned
+        points, runs BIC refinement on that data, returns whether refinement happened and final assignment in global indices.
+
+        Parameters
+        ----------
+        properties : np.ndarray, shape (N, n_features)
+            Full feature tensor.
+        assignment_global : np.ndarray
+            Global row indices of currently in-bounds points.
+        seed_idx : int, optional
+            Global row index of the seed (used to choose which cluster to keep when BIC splits).
+        t : np.ndarray, shape (N,), optional
+            Time for each row; used for drift correction when model has drift state.
+        min_points_for_cluster : int, optional
+            Minimum points to run BIC refinement (default 100).
+        max_iter : int, optional
+            Max BIC refinement iterations (default 3).
+
+        Returns
+        -------
+        bic_did_refine : bool
+            True if BIC refinement reduced the assignment.
+        assignment_global_refined : np.ndarray
+            Refined assignment in global indices.
+        """
+        n_features = len(self.mean)
+        if len(assignment_global) < min_points_for_cluster:
+            return (False, assignment_global)
+        points = np.asarray(properties[assignment_global], dtype=float)
+        t_assigned = t[assignment_global] if t is not None else None
+        points_dc = self._apply_drift_correction(points, t_assigned)
+        seed_row = None
+        if seed_idx is not None:
+            idx = np.where(assignment_global == seed_idx)[0]
+            seed_row = int(idx[0]) if len(idx) > 0 else None
+        in_bounds = np.arange(len(assignment_global), dtype=int)
+        iteration_count = 0
+        while iteration_count < max_iter:
+            if len(in_bounds) < min_points_for_cluster:
+                break
+            data = whiten_data(points_dc[in_bounds, :], self.covariance, center=self.mean)
+            gmm_1 = GaussianMixture(n_components=1, random_state=42, max_iter=100)
+            gmm_2 = GaussianMixture(n_components=2, random_state=42, max_iter=100)
+            gmm_1.fit(data)
+            gmm_2.fit(data)
+            bic_1 = gmm_1.bic(data)
+            bic_2 = gmm_2.bic(data)
+            dBIC = (bic_1 - bic_2) / len(data)
+            if dBIC <= self.bic_threshold:
+                break
+            labels = gmm_2.predict(data)
+            if seed_row is not None:
+                seed_in_data = np.where(in_bounds == seed_row)[0]
+                if len(seed_in_data) > 0:
+                    keep_label = gmm_2.predict(data[seed_in_data[0]:seed_in_data[0] + 1])[0]
+                    in_bounds = in_bounds[labels == keep_label]
+                else:
+                    center_label = gmm_2.predict(np.zeros((1, n_features)))
+                    in_bounds = in_bounds[labels == center_label[0]]
+            else:
+                center_label = gmm_2.predict(np.zeros((1, n_features)))
+                in_bounds = in_bounds[labels == center_label[0]]
+            iteration_count += 1
+        assignment_global_refined = assignment_global[in_bounds]
+        bic_did_refine = len(in_bounds) < len(assignment_global)
+        return (bic_did_refine, assignment_global_refined)
+
     def copy(self):
         """Return a copy of this model (same params; caller may pass copy to iterate without mutating this)."""
-        return GaussianModel(
+        other = GaussianModel(
             mean=np.copy(self.mean),
             covariance=np.copy(self.covariance),
             bic_threshold=self.bic_threshold,
@@ -711,9 +835,55 @@ class GaussianModel:
             sort_range=self.sort_range,
             sort_feature_idx=self.sort_feature_idx,
             density_curve=np.copy(self.density_curve) if self.density_curve is not None else None,
+            drift_correction=getattr(self, 'drift_correction', False),
+            features_to_drift_correct=getattr(self, 'features_to_drift_correct', None),
+            n_average=getattr(self, 'n_average', 20),
+        )
+        if getattr(self, 't_samples', None) is not None:
+            other.t_samples = self.t_samples
+        if getattr(self, 'feature_means', None) is not None:
+            other.feature_means = self.feature_means
+        if getattr(self, 'drift_corrected_feats', None) is not None:
+            other.drift_corrected_feats = self.drift_corrected_feats
+        return other
+
+    def prob_density_at(self, features, t=None):
+        """
+        Compute this model's probability density at each row of features (same formula as in_bounds_indices).
+        Applies drift correction when drift_corrected_feats/t_samples/feature_means are set and t is provided.
+
+        Parameters
+        ----------
+        features : np.ndarray, shape (n, n_features)
+            Points in model feature space.
+        t : np.ndarray, shape (n,), optional
+            Time for each row; used for drift correction when model has drift state.
+
+        Returns
+        -------
+        np.ndarray, shape (n,)
+            prob_density for each row (density_curve interpolation or linear decay from Mahalanobis distance).
+        """
+        features = np.asarray(features, dtype=float)
+        if features.shape[1] != len(self.mean):
+            raise ValueError("features second dimension must match model mean length")
+        data = self._apply_drift_correction(features, t)
+        mean_for_dist = np.copy(self.mean)
+        feats = getattr(self, 'drift_corrected_feats', None)
+        f_means = getattr(self, 'feature_means', None)
+        if feats is not None and f_means is not None and len(f_means) > 0:
+            mean_for_dist[feats] -= np.mean(f_means, axis=0)
+        diff = data - mean_for_dist
+        try:
+            inv_cov = np.linalg.pinv(self.covariance)
+        except Exception:
+            return np.zeros(features.shape[0], dtype=float)
+        mahal_d = np.einsum('ij,jk,ik->i', diff, inv_cov, diff) ** 0.5
+        return prob_density_from_curve_or_formula(
+            mahal_d, float(self.mah_threshold), density_curve=getattr(self, 'density_curve', None)
         )
 
-    def in_bounds_indices(self, features, current_max_prob):
+    def in_bounds_indices(self, features, current_max_prob, t=None):
         """
         Return row indices into the full feature tensor that lie within this model's boundary.
         Uses self.data_range to define the window; only rows in that range are considered.
@@ -723,6 +893,9 @@ class GaussianModel:
 
         Row i is in bounds iff prob_density > current_max_prob[i].
         prob_density from density_curve (interpolation) or linear decay max(0, 1 - mahal_d/mah_th).
+        If drift_corrected_feats/t_samples/feature_means are set and t is provided, window data
+        is drift-corrected and a locally corrected mean (mean minus mean of feature_means over t)
+        is used for distances; the stored model mean is not changed.
 
         Parameters
         ----------
@@ -730,6 +903,8 @@ class GaussianModel:
             Full feature tensor; n_features must match len(self.mean).
         current_max_prob : np.ndarray, shape (N,)
             Per-spike current max probability (or background density); same length as features. Required.
+        t : np.ndarray, shape (N,), optional
+            Time for each row; used for drift correction when model has drift_corrected_feats set.
 
         Returns
         -------
@@ -758,8 +933,15 @@ class GaussianModel:
             first_idx = min(first_idx, last_idx)
             window = features[first_idx:last_idx + 1, :]
             cmp_slice = current_max_prob[first_idx:last_idx + 1]
+        t_window = t[first_idx:last_idx + 1] if t is not None else None
+        window = self._apply_drift_correction(window, t_window)
+        mean_for_dist = np.copy(self.mean)
+        feats = getattr(self, 'drift_corrected_feats', None)
+        f_means = getattr(self, 'feature_means', None)
+        if feats is not None and f_means is not None and len(f_means) > 0:
+            mean_for_dist[feats] -= np.mean(f_means, axis=0)
         n = window.shape[0]
-        diff = window - self.mean
+        diff = window - mean_for_dist
         try:
             inv_cov = np.linalg.pinv(self.covariance)
         except:
@@ -773,6 +955,73 @@ class GaussianModel:
         )
         local_in = np.where(within_mah & (prob_density > cmp_slice[:n]))[0]
         return first_idx + local_in
+
+    def drift_correct(self, properties, current_max_prob, features_to_drift_correct, t=None, n_average=20):
+        """
+        Compute per-block mean time and mean feature values from in-bounds data for drift correction.
+        In-bounds data is sorted by 't'; if length is not a multiple of n_average, equally spaced
+        points are dropped so the rest can be split into contiguous blocks of n_average.
+        Stores t_samples (1d), feature_means (2d, shape n_blocks x n_features), and
+        drift_corrected_feats (list of feature indices) on the model.
+
+        Parameters
+        ----------
+        properties : np.ndarray, shape (N, n_features)
+            Feature tensor (same as for in_bounds_indices; typically included features only).
+        current_max_prob : np.ndarray, shape (N,)
+            Per-spike current max probability; required for in_bounds.
+        features_to_drift_correct : list of int
+            Column indices into properties for features to drift correct.
+        t : np.ndarray, shape (N,), optional
+            Time for each row; must match properties row order (e.g. from full properties tensor).
+            Required for drift correction; if None, sets empty t_samples/feature_means and returns.
+        n_average : int, optional
+            Block size for averaging (default 20).
+
+        Returns
+        -------
+        None (sets self.t_samples, self.feature_means, self.drift_corrected_feats).
+        """
+        properties = np.asarray(properties, dtype=float)
+        features_to_drift_correct = list(features_to_drift_correct)
+        if t is None or len(np.asarray(t).ravel()) != properties.shape[0]:
+            self.t_samples = np.array([], dtype=float)
+            self.feature_means = np.array([], dtype=float).reshape(0, len(features_to_drift_correct))
+            self.drift_corrected_feats = features_to_drift_correct
+            return
+        t = np.asarray(t, dtype=float).ravel()
+        in_bounds = self.in_bounds_indices(properties, current_max_prob, t=t)
+        n = len(in_bounds)
+        if n == 0:
+            self.t_samples = np.array([], dtype=float)
+            self.feature_means = np.array([], dtype=float).reshape(0, len(features_to_drift_correct))
+            self.drift_corrected_feats = features_to_drift_correct
+            return
+        t_vals = t[in_bounds]
+        feature_vals = properties[np.ix_(in_bounds, features_to_drift_correct)]
+        order = np.argsort(t_vals)
+        t_sorted = t_vals[order]
+        feature_sorted = feature_vals[order]
+        n_keep = (n // n_average) * n_average
+        if n_keep == 0:
+            self.t_samples = np.array([], dtype=float)
+            self.feature_means = np.array([], dtype=float).reshape(0, len(features_to_drift_correct))
+            self.drift_corrected_feats = features_to_drift_correct
+            return
+        n_drop = n - n_keep
+        drop_idx = np.linspace(0, n - 1, n_drop, endpoint=True).astype(int)
+        keep_mask = np.ones(n, dtype=bool)
+        keep_mask[drop_idx] = False
+        t_trimmed = t_sorted[keep_mask]
+        feature_trimmed = feature_sorted[keep_mask]
+        n_blocks = n_keep // n_average
+        t_trimmed_2d = t_trimmed.reshape(n_blocks, n_average)
+        feature_trimmed_2d = feature_trimmed.reshape(n_blocks, n_average, -1)
+        t_samples = np.mean(t_trimmed_2d, axis=1)
+        feature_means = np.mean(feature_trimmed_2d, axis=1)
+        self.t_samples = t_samples
+        self.feature_means = feature_means
+        self.drift_corrected_feats = features_to_drift_correct
 
     def compute_data_range(self, properties):
         """
@@ -789,8 +1038,17 @@ class GaussianModel:
         if std <= 0:
             std = 1.0
         center_sorted = float(self.mean[self.sort_feature_idx])
-        sort_lo = center_sorted - std * self.mah_threshold
-        sort_hi = center_sorted + std * self.mah_threshold
+        feats = getattr(self, 'drift_corrected_feats', None)
+        f_means = getattr(self, 'feature_means', None)
+        if feats is not None and f_means is not None and len(f_means) > 0 and self.sort_feature_idx in feats:
+            j = feats.index(self.sort_feature_idx)
+            min_f = float(np.min(self.feature_means[:, j]))
+            max_f = float(np.max(self.feature_means[:, j]))
+            sort_lo = min_f - std * self.mah_threshold
+            sort_hi = max_f + std * self.mah_threshold
+        else:
+            sort_lo = center_sorted - std * self.mah_threshold
+            sort_hi = center_sorted + std * self.mah_threshold
 
         prev_data_range = self.data_range
         prev_sort_range = self.sort_range
@@ -838,7 +1096,7 @@ class GaussianModel:
         return mvn.pdf(points)
 
 
-def _create_init_cluster_from_seed(properties, seed_idx, cluster_densities, curr_max_prob, settings):
+def _create_init_cluster_from_seed(properties, seed_idx, cluster_densities, curr_max_prob, settings, t=None):
     """
     Build initial Gaussian model from a seed: spatial window, COM refinement, covariance, and boundary (mah_th/size).
     Returns either a failure dict or a success dict with 'model' and 'in_bounds' for use by _fit_model_size.
@@ -862,7 +1120,6 @@ def _create_init_cluster_from_seed(properties, seed_idx, cluster_densities, curr
     density_threshold_for_init_distance = settings.get('density_threshold_for_init_distance', 0.1)
     gaussian_filter_sigma = settings.get('gaussian_filter_sigma', 50.0)
     dist_step = settings.get('dist_step', 0.1)
-    min_change = settings.get('min_change', 0.01)
     multi_cluster_threshold = settings.get('multi_cluster_threshold', 0.2)
     max_range_sorted = float(settings.get('max_range_sorted', initial_stds[sorted_feature_idx] * 4.0))
     n_samples_density_curve = int(settings.get('n_samples_density_curve', 101))
@@ -889,7 +1146,6 @@ def _create_init_cluster_from_seed(properties, seed_idx, cluster_densities, curr
     start_idx = np.searchsorted(sorted_feat_values, lower_bound, side='left')
     end_idx = np.searchsorted(sorted_feat_values, upper_bound, side='right')
     valid_indices = np.arange(start_idx, end_idx)
-    valid_indices_all = valid_indices.copy()
 
     if len(valid_indices) == 0:
         return {'success': False, 'message': f'No points within max range (sorted feature) of seed'}
@@ -915,7 +1171,9 @@ def _create_init_cluster_from_seed(properties, seed_idx, cluster_densities, curr
     if min_mahal_init > max_dist_scale * 2:
         return {'success': False, 'message': 'Local vicinity too sparse'}
 
-    init_model = GaussianModel(mean=m, covariance=covs, bic_threshold=multi_cluster_threshold, mah_threshold=init_mah_d, data_range=None, sort_feature_idx=sorted_feature_idx)
+    seed_cluster_density = float(cluster_densities[seed_idx])
+    flat_density_curve = np.full(n_samples_density_curve, seed_cluster_density, dtype=float)
+    init_model = GaussianModel(mean=m, covariance=covs, bic_threshold=multi_cluster_threshold, mah_threshold=init_mah_d, data_range=None, sort_feature_idx=sorted_feature_idx, density_curve=flat_density_curve)
     init_model.compute_data_range(properties)
     first_idx, last_idx = init_model.data_range
     in_bounds_global = init_model.in_bounds_indices(properties, curr_max_prob)
@@ -963,10 +1221,12 @@ def _create_init_cluster_from_seed(properties, seed_idx, cluster_densities, curr
 
     if len(in_bounds) < min_points_for_cluster:
         return {'success': False, 'message': f'Insufficient points after COM iteration: {len(in_bounds)} < {min_points_for_cluster}'}
-    in_bounds = apply_bic_refinement(
-        points, m, covs, in_bounds, multi_cluster_threshold, n_features,
-        min_points_for_cluster=min_points_for_cluster, seed_row=seed_in_valid
+    bic_model = GaussianModel(mean=m, covariance=covs, bic_threshold=multi_cluster_threshold, mah_threshold=1.0)
+    _, refined_global = bic_model.bic_refinement(
+        properties, valid_indices[in_bounds], seed_idx=seed_idx, t=t,
+        min_points_for_cluster=min_points_for_cluster, max_iter=3
     )
+    in_bounds = np.where(np.isin(valid_indices, refined_global))[0]
     if len(in_bounds) < min_points_for_cluster:
         return {'success': False, 'message': f'Insufficient points after BIC refinement (COM): {len(in_bounds)} < {min_points_for_cluster}'}
     Nk = np.sum(HC[in_bounds])
@@ -1022,11 +1282,11 @@ def _create_init_cluster_from_seed(properties, seed_idx, cluster_densities, curr
     model_after_mah_th = GaussianModel(mean=m, covariance=covs, bic_threshold=multi_cluster_threshold, mah_threshold=mah_th, data_range=(first_idx, last_idx), density_curve=density_curve)
     in_bounds_mah_th_global = model_after_mah_th.in_bounds_indices(properties, curr_max_prob)
     in_bounds_mah_th = np.where(np.isin(valid_indices, in_bounds_mah_th_global))[0]
-    in_bounds_mah_th = apply_bic_refinement(
-        points, m, covs, in_bounds_mah_th, multi_cluster_threshold, n_features,
-        min_points_for_cluster=min_points_for_cluster, seed_row=seed_in_valid
+    _, in_bounds_mah_th_global = model_after_mah_th.bic_refinement(
+        properties, valid_indices[in_bounds_mah_th], seed_idx=seed_idx, t=settings.get('t'),
+        min_points_for_cluster=min_points_for_cluster, max_iter=3
     )
-    in_bounds_mah_th_global = valid_indices[in_bounds_mah_th]
+    in_bounds_mah_th = np.where(np.isin(valid_indices, in_bounds_mah_th_global))[0]
 
     debug_cb = settings.get('debug_after_com_callback')
     if debug_cb is not None:
@@ -1058,11 +1318,24 @@ def _create_init_cluster_from_seed(properties, seed_idx, cluster_densities, curr
             'debug_data': {'points': points, 'mahal_d': mahal_d, 'mah_th': mah_th, 'center': m, 'covariance': covs}
         }
 
+    drift_correction = bool(settings.get('drift_correction', False))
+    features_to_drift_correct = settings.get('features_to_drift_correct', None)
+    if features_to_drift_correct is not None:
+        features_to_drift_correct = list(np.atleast_1d(np.asarray(features_to_drift_correct, dtype=int)).ravel())
+    else:
+        features_to_drift_correct = [sorted_feature_idx] if n_features > 0 else []
+    features_to_drift_correct = [int(x) for x in features_to_drift_correct if 0 <= x < n_features]
+    n_average = int(settings.get('n_average', 20))
     model = GaussianModel(
         mean=m.copy(), covariance=covs.copy(), bic_threshold=multi_cluster_threshold, mah_threshold=mah_th,
         data_range=None, sort_range=None, sort_feature_idx=sorted_feature_idx, density_curve=density_curve,
+        drift_correction=drift_correction, features_to_drift_correct=features_to_drift_correct, n_average=n_average,
     )
     model.compute_data_range(properties)
+    if model.drift_correction and t is not None and len(model.features_to_drift_correct) > 0:
+        t_arr = np.asarray(t, dtype=float).ravel()
+        if len(t_arr) == properties.shape[0]:
+            model.drift_correct(properties, curr_max_prob, model.features_to_drift_correct, t=t_arr, n_average=model.n_average)
     first_idx, last_idx = model.data_range
     valid_indices = np.arange(first_idx, last_idx + 1)
     if seed_idx < first_idx or seed_idx > last_idx:
@@ -1145,7 +1418,6 @@ def _create_init_cluster_from_cluster_data(properties, cluster_densities, curr_m
             'message': f'No points within max distance ({max_dist_for_init_bound}) for boundary detection. Mahalanobis distances: min={min_mahal:.3f}, max={max_mahal:.3f}, mean={np.mean(mahal_d):.3f}'
         }
     # 3) Rolling HC curve on ALL that data (full tensor subset) sorted by Mahal
-    points_w = whiten_data(points[in_max, :], covs, center=m)
     mah_sort_ind = np.argsort(mahal_d[in_max])
     mahal_d_s = mahal_d[in_max[mah_sort_ind]]
     HC_sorted = HC[in_max[mah_sort_ind]]
@@ -1175,21 +1447,28 @@ def _create_init_cluster_from_cluster_data(properties, cluster_densities, curr_m
         density_curve = None
 
     # 6) Initial model; data window is determined by sort_range on full properties
+    drift_correction = bool(settings.get('drift_correction', False))
+    features_to_drift = settings.get('features_to_drift_correct')
+    n_avg = int(settings.get('n_average', 20))
     model = GaussianModel(
         mean=m.copy(), covariance=covs.copy(), bic_threshold=multi_cluster_threshold, mah_threshold=float(mah_th),
         data_range=None, sort_range=None, sort_feature_idx=sorted_feature_idx, density_curve=density_curve,
+        drift_correction=drift_correction, features_to_drift_correct=features_to_drift, n_average=n_avg,
     )
     model.compute_data_range(properties)
     first_idx, last_idx = model.data_range
-    in_bounds_global = model.in_bounds_indices(properties, curr_max_prob)
+    t_arr = settings.get('t')
+    in_bounds_global = model.in_bounds_indices(properties, curr_max_prob, t=t_arr)
     in_bounds = (in_bounds_global - first_idx).astype(int)
-    window_points = points[first_idx:last_idx + 1]
-    in_bounds = apply_bic_refinement(
-        window_points, m, covs, in_bounds, multi_cluster_threshold, n_features,
-        min_points_for_cluster=min_points_for_cluster, seed_row=None
+    _, in_bounds_global = model.bic_refinement(
+        properties, in_bounds_global, seed_idx=None, t=t_arr,
+        min_points_for_cluster=min_points_for_cluster, max_iter=3
     )
+    in_bounds = (in_bounds_global - first_idx).astype(int)
+    in_bounds = in_bounds[(in_bounds >= 0) & (in_bounds <= last_idx - first_idx)]
     if len(in_bounds) < min_points_for_cluster:
         return {'success': False, 'message': f'Insufficient points after BIC refinement: {len(in_bounds)} < {min_points_for_cluster}'}
+    window_points = points[first_idx:last_idx + 1]
     diff_window = window_points - m
     mahal_d_window = np.einsum('ij,jk,ik->i', diff_window, inv_cov, diff_window) ** 0.5
     seed_idx_debug = int(cluster_indices[0]) if len(cluster_indices) > 0 else first_idx
@@ -1252,6 +1531,13 @@ def make_gaussian_model_from_cluster(properties, cluster_densities, curr_max_pro
     if stability_failed:
         model = init_result['model'].copy()
         in_bounds = init_result['in_bounds'].copy()
+    # Ensure drift state (t_samples, feature_means) for accept/reject dialog t vs feature range lines
+    if getattr(model, 'drift_correction', False) and getattr(model, 'features_to_drift_correct', None) and len(model.features_to_drift_correct) > 0 and settings.get('t') is not None:
+        t_arr = np.asarray(settings['t'], dtype=float).ravel()
+        if len(t_arr) == properties.shape[0]:
+            has_drift = (getattr(model, 't_samples', None) is not None and getattr(model, 'feature_means', None) is not None and len(model.t_samples) > 0)
+            if not has_drift:
+                model.drift_correct(properties, curr_max_prob, model.features_to_drift_correct, t=t_arr, n_average=getattr(model, 'n_average', 20))
     first_idx, last_idx = model.data_range
     window_indices = np.arange(first_idx, last_idx + 1)
     points = np.asarray(properties[window_indices, :], dtype=float)
@@ -1267,17 +1553,17 @@ def make_gaussian_model_from_cluster(properties, cluster_densities, curr_max_pro
     viz_last = min(max(viz_last, viz_first), n_spikes - 1)
     valid_indices_all = np.arange(viz_first, viz_last + 1)
     points_all = np.asarray(properties[valid_indices_all, :], dtype=float)
-    in_bounds_global = model.in_bounds_indices(properties, curr_max_prob)
+    t_arr = settings.get('t')
+    in_bounds_global = model.in_bounds_indices(properties, curr_max_prob, t=t_arr)
+    in_bounds_all = np.where(np.isin(valid_indices_all, in_bounds_global))[0]
+    _, in_bounds_global = model.bic_refinement(
+        properties, valid_indices_all[in_bounds_all], seed_idx=seed_idx_global, t=t_arr,
+        min_points_for_cluster=settings.get('min_points_for_cluster', 100), max_iter=3
+    )
     in_bounds_all = np.where(np.isin(valid_indices_all, in_bounds_global))[0]
     seed_row_in_points = (seed_idx_global - viz_first) if (viz_first <= seed_idx_global <= viz_last) else None
     if seed_row_in_points is None and len(valid_indices_all) > 0:
         seed_row_in_points = int(np.argmin(np.abs(valid_indices_all - seed_idx_global)))
-    in_bounds_all = apply_bic_refinement(
-        points_all, model.mean, model.covariance,
-        in_bounds_all, model.bic_threshold, properties.shape[1],
-        min_points_for_cluster=settings.get('min_points_for_cluster', 100),
-        seed_row=seed_row_in_points
-    )
     # valid_indices = 0-based into data window (for dialog: valid_indices_global = window_indices[valid_indices])
     valid_indices_0based = np.arange(0, last_idx - first_idx + 1)
     seed_idx_in_window = (seed_idx_global - first_idx) if (first_idx <= seed_idx_global <= last_idx) else 0
@@ -1336,6 +1622,7 @@ def _fit_model_size(properties, cluster_densities, model, in_bounds, seed_idx, c
     min_change = settings.get('min_change', 0.01)
     min_points_for_cluster = int(settings.get('min_points_for_cluster', 100))
     max_iter_for_model = int(settings.get('max_iter_for_model', 500))
+    t = settings.get('t')
 
     stability_failed = False
     iter_count = 0
@@ -1356,7 +1643,7 @@ def _fit_model_size(properties, cluster_densities, model, in_bounds, seed_idx, c
         outcome, model_out, assignment_out, _ = iterate_GM_model(
             properties, cluster_densities, model.copy(), sort_feature_idx, max_range_sorted,
             seed_idx, min_change=min_change, min_points_for_cluster=min_points_for_cluster,
-            curr_max_prob=curr_max_prob
+            curr_max_prob=curr_max_prob, t=t
         )
         current_size = _round_step(model.mah_threshold, dist_step)
         iteration_history_full.append((iter_count, float(current_size), outcome))
@@ -1373,7 +1660,7 @@ def _fit_model_size(properties, cluster_densities, model, in_bounds, seed_idx, c
                     outcome_s1, model_out_s1, assignment_out_s1, _ = iterate_GM_model(
                         properties, cluster_densities, model.copy(), sort_feature_idx, max_range_sorted,
                         seed_idx, min_change=min_change, min_points_for_cluster=min_points_for_cluster,
-                        curr_max_prob=curr_max_prob
+                        curr_max_prob=curr_max_prob, t=t
                     )
                     model = model_out_s1
                     in_bounds = assignment_out_s1
@@ -1406,7 +1693,7 @@ def _fit_model_size(properties, cluster_densities, model, in_bounds, seed_idx, c
                     outcome_s1, model_out_s1, assignment_out_s1, _ = iterate_GM_model(
                         properties, cluster_densities, model.copy(), sort_feature_idx, max_range_sorted,
                         seed_idx, min_change=min_change, min_points_for_cluster=min_points_for_cluster,
-                        curr_max_prob=curr_max_prob
+                        curr_max_prob=curr_max_prob, t=t
                     )
                     model = model_out_s1
                     in_bounds = assignment_out_s1
@@ -1504,6 +1791,13 @@ def fit_gaussian_model_from_seed(properties, seed_idx, cluster_densities, curr_m
     if stability_failed:
         model = initial_model
         in_bounds = init_result['in_bounds']
+    # Ensure drift state (t_samples, feature_means) for accept/reject dialog t vs feature range lines
+    if getattr(model, 'drift_correction', False) and getattr(model, 'features_to_drift_correct', None) and len(model.features_to_drift_correct) > 0 and settings.get('t') is not None:
+        t_arr = np.asarray(settings['t'], dtype=float).ravel()
+        if len(t_arr) == properties.shape[0]:
+            has_drift = (getattr(model, 't_samples', None) is not None and getattr(model, 'feature_means', None) is not None and len(model.t_samples) > 0)
+            if not has_drift:
+                model.drift_correct(properties, curr_max_prob, model.features_to_drift_correct, t=t_arr, n_average=getattr(model, 'n_average', 20))
     n_features = properties.shape[1]
     multi_cluster_threshold = settings.get('multi_cluster_threshold', 0.2)
     min_points_for_cluster = int(settings.get('min_points_for_cluster', 100))
@@ -1530,6 +1824,11 @@ def fit_gaussian_model_from_seed(properties, seed_idx, cluster_densities, curr_m
     covs = model.covariance
     mah_th = model.mah_threshold
     gaussian_model = model
+    t_for_bounds = None
+    if getattr(gaussian_model, 'drift_corrected_feats', None) is not None and settings.get('t') is not None:
+        t_arr = np.asarray(settings['t'], dtype=float).ravel()
+        if len(t_arr) == properties.shape[0]:
+            t_for_bounds = t_arr
 
     # Visualization and seed check using final model parameters
     try:
@@ -1544,7 +1843,7 @@ def fit_gaussian_model_from_seed(properties, seed_idx, cluster_densities, curr_m
         points_all = properties[valid_indices_all, :]
         HC_all = cluster_densities[valid_indices_all]
         mahal_d_all = np.einsum('ij,jk,ik->i', points_all - m, inv_cov_final, points_all - m) ** 0.5
-        in_bounds_global = gaussian_model.in_bounds_indices(properties, curr_max_prob)
+        in_bounds_global = gaussian_model.in_bounds_indices(properties, curr_max_prob, t=t_for_bounds)
         in_bounds_all = (in_bounds_global - valid_indices_all[0]).astype(int)
         seed_row_in_points = np.where(valid_indices_all == seed_idx)[0]
         seed_row_in_points = int(seed_row_in_points[0]) if len(seed_row_in_points) > 0 else None
@@ -1568,7 +1867,7 @@ def fit_gaussian_model_from_seed(properties, seed_idx, cluster_densities, curr_m
         points_all = properties[valid_indices_all, :]
         HC_all = cluster_densities[valid_indices_all]
         mahal_d_all = np.einsum('ij,jk,ik->i', points_all - m, inv_cov_final, points_all - m) ** 0.5
-        in_bounds_global = gaussian_model.in_bounds_indices(properties, curr_max_prob)
+        in_bounds_global = gaussian_model.in_bounds_indices(properties, curr_max_prob, t=t_for_bounds)
         in_bounds_all = (in_bounds_global - valid_indices_all[0]).astype(int)
         seed_row_in_points = np.where(valid_indices_all == seed_idx)[0]
         seed_row_in_points = int(seed_row_in_points[0]) if len(seed_row_in_points) > 0 else None
@@ -1592,16 +1891,15 @@ def fit_gaussian_model_from_seed(properties, seed_idx, cluster_densities, curr_m
     HC_all = cluster_densities[valid_indices_all]
     diff_all = points_all - m
     mahal_d_all = np.einsum('ij,jk,ik->i', diff_all, inv_cov_final, diff_all) ** 0.5
-    in_bounds_global = gaussian_model.in_bounds_indices(properties, curr_max_prob)
+    in_bounds_global = gaussian_model.in_bounds_indices(properties, curr_max_prob, t=t_for_bounds)
     in_bounds_all = (in_bounds_global - valid_indices_all[0]).astype(int)
     seed_row_in_points = np.where(valid_indices_all == seed_idx)[0]
     seed_row_in_points = int(seed_row_in_points[0]) if len(seed_row_in_points) > 0 else None
-    in_bounds_all = apply_bic_refinement(
-        points_all, m, covs,
-        in_bounds_all, multi_cluster_threshold, n_features,
-        min_points_for_cluster=min_points_for_cluster,
-        seed_row=seed_row_in_points
+    _, in_bounds_global = gaussian_model.bic_refinement(
+        properties, in_bounds_global, seed_idx=seed_idx, t=t_for_bounds,
+        min_points_for_cluster=min_points_for_cluster, max_iter=3
     )
+    in_bounds_all = np.where(np.isin(valid_indices_all, in_bounds_global))[0]
     # visualization_data: arrays for viz; model params (center/covariance) come from result['model']
     viz = {
         'points': points_all,
